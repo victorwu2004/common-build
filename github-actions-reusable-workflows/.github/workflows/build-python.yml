@@ -1,0 +1,232 @@
+name: Build Python Application
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python version'
+        required: false
+        type: string
+        default: '3.11'
+      package-manager:
+        description: 'Package manager (pip, poetry, pipenv)'
+        required: false
+        type: string
+        default: 'pip'
+      working-directory:
+        description: 'Working directory'
+        required: false
+        type: string
+        default: '.'
+      artifact-name:
+        description: 'Name for the build artifact'
+        required: true
+        type: string
+      run-tests:
+        description: 'Run unit tests'
+        required: false
+        type: boolean
+        default: true
+      test-command:
+        description: 'Custom test command'
+        required: false
+        type: string
+        default: ''
+      build-wheel:
+        description: 'Build wheel distribution'
+        required: false
+        type: boolean
+        default: true
+      requirements-file:
+        description: 'Path to requirements file'
+        required: false
+        type: string
+        default: 'requirements.txt'
+    outputs:
+      artifact-name:
+        description: 'Name of the uploaded artifact'
+        value: ${{ jobs.build.outputs.artifact-name }}
+      version:
+        description: 'Build version'
+        value: ${{ jobs.build.outputs.version }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-name: ${{ inputs.artifact-name }}
+      version: ${{ steps.version.outputs.version }}
+    
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install Poetry
+        if: inputs.package-manager == 'poetry'
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Cache dependencies (pip)
+        if: inputs.package-manager == 'pip'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Cache dependencies (poetry)
+        if: inputs.package-manager == 'poetry'
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Generate version
+        id: version
+        run: |
+          if [[ -f "pyproject.toml" ]]; then
+            BASE_VERSION=$(grep -m1 'version' pyproject.toml | cut -d'"' -f2 || echo "1.0.0")
+          elif [[ -f "setup.py" ]]; then
+            BASE_VERSION=$(python setup.py --version 2>/dev/null || echo "1.0.0")
+          else
+            BASE_VERSION="1.0.0"
+          fi
+          
+          if [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == "refs/heads/master" ]]; then
+            VERSION="${BASE_VERSION}"
+          else
+            VERSION="${BASE_VERSION}.dev${{ github.run_number }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Generated version: $VERSION"
+
+      - name: Install dependencies (pip)
+        if: inputs.package-manager == 'pip'
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          if [[ -f "${{ inputs.requirements-file }}" ]]; then
+            pip install -r ${{ inputs.requirements-file }}
+          fi
+          if [[ -f "requirements-dev.txt" ]]; then
+            pip install -r requirements-dev.txt
+          fi
+          pip install build pytest pytest-cov flake8
+
+      - name: Install dependencies (poetry)
+        if: inputs.package-manager == 'poetry'
+        run: poetry install --with dev
+
+      - name: Install dependencies (pipenv)
+        if: inputs.package-manager == 'pipenv'
+        run: |
+          pip install pipenv
+          pipenv install --dev
+
+      - name: Run linting
+        run: |
+          if [[ "${{ inputs.package-manager }}" == "poetry" ]]; then
+            poetry run flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics || true
+          elif [[ "${{ inputs.package-manager }}" == "pipenv" ]]; then
+            pipenv run flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics || true
+          else
+            flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics || true
+          fi
+        continue-on-error: true
+
+      - name: Run tests
+        if: inputs.run-tests
+        run: |
+          if [[ -n "${{ inputs.test-command }}" ]]; then
+            if [[ "${{ inputs.package-manager }}" == "poetry" ]]; then
+              poetry run ${{ inputs.test-command }}
+            elif [[ "${{ inputs.package-manager }}" == "pipenv" ]]; then
+              pipenv run ${{ inputs.test-command }}
+            else
+              ${{ inputs.test-command }}
+            fi
+          else
+            if [[ "${{ inputs.package-manager }}" == "poetry" ]]; then
+              poetry run pytest --cov --cov-report=xml --junitxml=junit.xml || true
+            elif [[ "${{ inputs.package-manager }}" == "pipenv" ]]; then
+              pipenv run pytest --cov --cov-report=xml --junitxml=junit.xml || true
+            else
+              pytest --cov --cov-report=xml --junitxml=junit.xml || true
+            fi
+          fi
+
+      - name: Upload test results
+        if: inputs.run-tests && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}-test-results
+          path: |
+            ${{ inputs.working-directory }}/coverage.xml
+            ${{ inputs.working-directory }}/junit.xml
+          retention-days: 7
+        continue-on-error: true
+
+      - name: Build wheel
+        if: inputs.build-wheel
+        run: |
+          if [[ "${{ inputs.package-manager }}" == "poetry" ]]; then
+            poetry build
+          elif [[ "${{ inputs.package-manager }}" == "pipenv" ]]; then
+            pipenv run python -m build
+          else
+            python -m build
+          fi
+
+      - name: Package artifacts
+        run: |
+          mkdir -p ./build-package
+          
+          if [[ -d "dist" ]]; then
+            cp -r dist/* ./build-package/
+          fi
+          
+          cp ${{ inputs.requirements-file }} ./build-package/ 2>/dev/null || true
+          cp pyproject.toml ./build-package/ 2>/dev/null || true
+          cp setup.py ./build-package/ 2>/dev/null || true
+          
+          # Copy source directories
+          for dir in $(find . -maxdepth 1 -type d ! -name '.*' ! -name 'dist' ! -name 'build' ! -name 'build-package' ! -name '__pycache__' ! -name '.venv' ! -name 'venv'); do
+            cp -r "$dir" ./build-package/ 2>/dev/null || true
+          done
+          
+          cd build-package
+          zip -r ../build-artifacts.zip .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.working-directory }}/build-artifacts.zip
+          retention-days: 5
+
+      - name: Build Summary
+        run: |
+          echo "## 🐍 Python Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Python Version | ${{ inputs.python-version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Package Manager | ${{ inputs.package-manager }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ steps.version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests Run | ${{ inputs.run-tests }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Wheel | ${{ inputs.build-wheel }} |" >> $GITHUB_STEP_SUMMARY

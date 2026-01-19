@@ -1,0 +1,291 @@
+name: Build .NET Application
+
+on:
+  workflow_call:
+    inputs:
+      dotnet-version:
+        description: '.NET SDK version'
+        required: false
+        type: string
+        default: '8.0.x'
+      project-path:
+        description: 'Path to the project or solution file'
+        required: true
+        type: string
+      configuration:
+        description: 'Build configuration (Debug/Release)'
+        required: false
+        type: string
+        default: 'Release'
+      artifact-name:
+        description: 'Name for the build artifact'
+        required: true
+        type: string
+      publish-path:
+        description: 'Path to publish output'
+        required: false
+        type: string
+        default: './publish'
+      run-tests:
+        description: 'Run unit tests'
+        required: false
+        type: boolean
+        default: true
+      test-project-path:
+        description: 'Path to test project(s)'
+        required: false
+        type: string
+        default: '**/*Tests.csproj'
+      # NuGet specific inputs
+      nuget-source-url:
+        description: 'Private NuGet feed URL for restore'
+        required: false
+        type: string
+        default: ''
+      nuget-config-path:
+        description: 'Path to NuGet.config file'
+        required: false
+        type: string
+        default: ''
+      create-nuget-package:
+        description: 'Create NuGet package'
+        required: false
+        type: boolean
+        default: false
+      nuget-package-id:
+        description: 'NuGet package ID (defaults to project name)'
+        required: false
+        type: string
+        default: ''
+      nuget-include-symbols:
+        description: 'Include symbols package'
+        required: false
+        type: boolean
+        default: true
+      nuget-include-source:
+        description: 'Include source files in symbols package'
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      artifact-name:
+        description: 'Name of the uploaded artifact'
+        value: ${{ jobs.build.outputs.artifact-name }}
+      version:
+        description: 'Build version'
+        value: ${{ jobs.build.outputs.version }}
+      nuget-artifact-name:
+        description: 'Name of the NuGet package artifact'
+        value: ${{ jobs.build.outputs.nuget-artifact-name }}
+    secrets:
+      NUGET_AUTH_TOKEN:
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-name: ${{ inputs.artifact-name }}
+      version: ${{ steps.version.outputs.version }}
+      nuget-artifact-name: ${{ steps.nuget-pack.outputs.nuget-artifact-name }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Generate version
+        id: version
+        run: |
+          VERSION_PREFIX=""
+          
+          if [[ -f "Directory.Build.props" ]]; then
+            VERSION_PREFIX=$(grep -oP '(?<=<VersionPrefix>)[^<]+' Directory.Build.props 2>/dev/null || echo "")
+          fi
+          
+          if [[ -z "$VERSION_PREFIX" ]] && [[ -f "${{ inputs.project-path }}" ]]; then
+            VERSION_PREFIX=$(grep -oP '(?<=<Version>)[^<]+' "${{ inputs.project-path }}" 2>/dev/null || echo "")
+            if [[ -z "$VERSION_PREFIX" ]]; then
+              VERSION_PREFIX=$(grep -oP '(?<=<VersionPrefix>)[^<]+' "${{ inputs.project-path }}" 2>/dev/null || echo "")
+            fi
+          fi
+          
+          if [[ -z "$VERSION_PREFIX" ]]; then
+            VERSION_PREFIX="1.0.0"
+          fi
+          
+          if [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == "refs/heads/master" ]]; then
+            VERSION="${VERSION_PREFIX}"
+          else
+            BRANCH_NAME=$(echo "${{ github.ref_name }}" | sed 's/[^a-zA-Z0-9]/-/g' | cut -c1-20)
+            VERSION="${VERSION_PREFIX}-${BRANCH_NAME}.${{ github.run_number }}"
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version-prefix=$VERSION_PREFIX" >> $GITHUB_OUTPUT
+          echo "Generated version: $VERSION"
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Configure NuGet sources
+        if: inputs.nuget-source-url != '' || inputs.nuget-config-path != ''
+        run: |
+          if [[ -n "${{ inputs.nuget-config-path }}" ]] && [[ -f "${{ inputs.nuget-config-path }}" ]]; then
+            echo "Using custom NuGet.config: ${{ inputs.nuget-config-path }}"
+            cp "${{ inputs.nuget-config-path }}" ./NuGet.config
+          fi
+          
+          if [[ -n "${{ inputs.nuget-source-url }}" ]]; then
+            echo "Adding private NuGet source..."
+            if [[ -n "${{ secrets.NUGET_AUTH_TOKEN }}" ]]; then
+              dotnet nuget add source "${{ inputs.nuget-source-url }}" \
+                --name "PrivateFeed" \
+                --username "az" \
+                --password "${{ secrets.NUGET_AUTH_TOKEN }}" \
+                --store-password-in-clear-text
+            else
+              dotnet nuget add source "${{ inputs.nuget-source-url }}" --name "PrivateFeed"
+            fi
+          fi
+          
+          echo "Configured NuGet sources:"
+          dotnet nuget list source
+
+      - name: Restore NuGet packages
+        run: |
+          echo "Restoring NuGet packages..."
+          RESTORE_ARGS="${{ inputs.project-path }}"
+          
+          if [[ -f "./NuGet.config" ]]; then
+            RESTORE_ARGS="$RESTORE_ARGS --configfile ./NuGet.config"
+          elif [[ -n "${{ inputs.nuget-config-path }}" ]] && [[ -f "${{ inputs.nuget-config-path }}" ]]; then
+            RESTORE_ARGS="$RESTORE_ARGS --configfile ${{ inputs.nuget-config-path }}"
+          fi
+          
+          if [[ -f "packages.lock.json" ]] || find . -name "packages.lock.json" -type f | grep -q .; then
+            echo "Lock file found, using locked mode..."
+            RESTORE_ARGS="$RESTORE_ARGS --locked-mode"
+          fi
+          
+          dotnet restore $RESTORE_ARGS --verbosity normal
+          echo "✅ NuGet restore completed"
+
+      - name: Build
+        run: |
+          echo "Building project..."
+          dotnet build ${{ inputs.project-path }} \
+            --configuration ${{ inputs.configuration }} \
+            --no-restore \
+            -p:Version=${{ steps.version.outputs.version }} \
+            -p:AssemblyVersion=${{ steps.version.outputs.version-prefix }}.0 \
+            -p:FileVersion=${{ steps.version.outputs.version-prefix }}.${{ github.run_number }}
+          echo "✅ Build completed"
+
+      - name: Run tests
+        if: inputs.run-tests
+        run: |
+          echo "Running tests..."
+          dotnet test ${{ inputs.test-project-path }} \
+            --configuration ${{ inputs.configuration }} \
+            --no-build \
+            --verbosity normal \
+            --logger "trx;LogFileName=test-results.trx" \
+            --logger "console;verbosity=detailed" \
+            --collect:"XPlat Code Coverage" \
+            --results-directory ./TestResults
+          echo "✅ Tests completed"
+
+      - name: Upload test results
+        if: inputs.run-tests && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}-test-results
+          path: ./TestResults
+          retention-days: 7
+
+      - name: Create NuGet package
+        id: nuget-pack
+        if: inputs.create-nuget-package
+        run: |
+          echo "Creating NuGet package..."
+          mkdir -p ./nupkg
+          
+          PACK_ARGS="${{ inputs.project-path }}"
+          PACK_ARGS="$PACK_ARGS --configuration ${{ inputs.configuration }}"
+          PACK_ARGS="$PACK_ARGS --no-build"
+          PACK_ARGS="$PACK_ARGS --output ./nupkg"
+          PACK_ARGS="$PACK_ARGS -p:PackageVersion=${{ steps.version.outputs.version }}"
+          
+          if [[ -n "${{ inputs.nuget-package-id }}" ]]; then
+            PACK_ARGS="$PACK_ARGS -p:PackageId=${{ inputs.nuget-package-id }}"
+          fi
+          
+          if [[ "${{ inputs.nuget-include-symbols }}" == "true" ]]; then
+            PACK_ARGS="$PACK_ARGS --include-symbols -p:SymbolPackageFormat=snupkg"
+            if [[ "${{ inputs.nuget-include-source }}" == "true" ]]; then
+              PACK_ARGS="$PACK_ARGS --include-source"
+            fi
+          fi
+          
+          dotnet pack $PACK_ARGS
+          
+          echo "Created packages:"
+          ls -la ./nupkg/
+          
+          echo "nuget-artifact-name=${{ inputs.artifact-name }}-nuget" >> $GITHUB_OUTPUT
+          echo "✅ NuGet package created"
+
+      - name: Upload NuGet packages
+        if: inputs.create-nuget-package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}-nuget
+          path: ./nupkg/*
+          retention-days: 5
+
+      - name: Publish application
+        run: |
+          echo "Publishing application..."
+          dotnet publish ${{ inputs.project-path }} \
+            --configuration ${{ inputs.configuration }} \
+            --no-build \
+            --output ${{ inputs.publish-path }} \
+            -p:Version=${{ steps.version.outputs.version }}
+          echo "✅ Publish completed"
+
+      - name: Package artifacts
+        run: |
+          echo "Packaging artifacts..."
+          cd ${{ inputs.publish-path }}
+          zip -r ../build-artifact.zip .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.publish-path }}/../build-artifact.zip
+          retention-days: 5
+
+      - name: Build Summary
+        run: |
+          echo "## 🔨 .NET Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| .NET Version | ${{ inputs.dotnet-version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Configuration | ${{ inputs.configuration }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ steps.version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests Run | ${{ inputs.run-tests }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| NuGet Package | ${{ inputs.create-nuget-package }} |" >> $GITHUB_STEP_SUMMARY
