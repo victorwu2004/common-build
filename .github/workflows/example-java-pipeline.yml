@@ -1,0 +1,136 @@
+name: Java CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  APPLICATION_NAME: 'my-java-app'
+
+jobs:
+  # ============================================
+  # Stage 1: Build
+  # ============================================
+  build:
+    uses: ./.github/workflows/build-java.yml
+    with:
+      java-version: '17'
+      java-distribution: 'temurin'
+      build-tool: 'maven'  # or 'gradle'
+      pom-path: 'pom.xml'
+      artifact-name: 'java-build-artifact'
+      run-tests: true
+      maven-goals: 'clean package'
+
+  # ============================================
+  # Stage 2: Security Scans (Parallel)
+  # Using composite actions for reusability
+  # ============================================
+  veracode-scan:
+    needs: build
+    uses: ./.github/workflows/scan-veracode.yml
+    with:
+      artifact-name: 'java-build-artifact'
+      application-name: ${{ github.event.repository.name }}
+      scan-type: ${{ github.ref == 'refs/heads/main' && 'policy' || 'sandbox' }}
+      fail-on-severity: 'High'
+      timeout-minutes: 90
+    secrets:
+      VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+      VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+
+  nexus-iq-scan:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: java-build-artifact
+          path: ./artifact
+
+      - name: Extract artifact
+        run: |
+          cd ./artifact
+          if ls *.zip 1> /dev/null 2>&1; then
+            unzip -o *.zip
+          fi
+
+      - name: Run Nexus IQ Scan
+        uses: ./.github/actions/nexus-iq-scan
+        with:
+          nexus-iq-url: ${{ secrets.NEXUS_IQ_URL }}
+          nexus-iq-username: ${{ secrets.NEXUS_IQ_USERNAME }}
+          nexus-iq-password: ${{ secrets.NEXUS_IQ_PASSWORD }}
+          application-id: ${{ github.event.repository.name }}
+          scan-targets: './artifact'
+          stage: ${{ github.ref == 'refs/heads/main' && 'release' || 'build' }}
+          fail-on-policy-warnings: false
+
+  # ============================================
+  # Stage 3: Publish to Nexus (Stage)
+  # Using composite action for publishing
+  # ============================================
+  publish-staging:
+    needs: [build, veracode-scan, nexus-iq-scan]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: java-build-artifact
+          path: ./artifact
+
+      - name: Find JAR file
+        id: find-jar
+        run: |
+          cd ./artifact
+          if ls *.zip 1> /dev/null 2>&1; then
+            unzip -o *.zip
+          fi
+          JAR_FILE=$(find . -name "*.jar" -not -name "*-sources.jar" -not -name "*-javadoc.jar" | head -1)
+          echo "jar-path=$JAR_FILE" >> $GITHUB_OUTPUT
+
+      - name: Publish to Nexus
+        uses: ./.github/actions/nexus-publish
+        with:
+          nexus-url: ${{ secrets.NEXUS_URL }}
+          nexus-username: ${{ secrets.NEXUS_USERNAME }}
+          nexus-password: ${{ secrets.NEXUS_PASSWORD }}
+          repository-format: 'maven'
+          repository-name: ${{ github.ref == 'refs/heads/main' && 'maven-releases' || 'maven-snapshots' }}
+          artifact-path: './artifact/${{ steps.find-jar.outputs.jar-path }}'
+          group-id: 'com.example'
+          artifact-id: 'my-java-app'
+          version: ${{ needs.build.outputs.version }}
+          extension: 'jar'
+
+  # ============================================
+  # Summary Job
+  # ============================================
+  pipeline-summary:
+    needs: [build, veracode-scan, nexus-iq-scan, publish-staging]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pipeline Summary
+        run: |
+          echo "## ☕ Java Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Veracode Scan | ${{ needs.veracode-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Nexus IQ Scan | ${{ needs.nexus-iq-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Publish Staging | ${{ needs.publish-staging.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ needs.build.outputs.version }}" >> $GITHUB_STEP_SUMMARY

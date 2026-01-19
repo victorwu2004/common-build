@@ -1,0 +1,124 @@
+name: .NET CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  APPLICATION_NAME: 'my-dotnet-app'
+
+jobs:
+  # ============================================
+  # Stage 1: Build with NuGet
+  # ============================================
+  build:
+    uses: ./.github/workflows/build-dotnet.yml
+    with:
+      dotnet-version: '8.0.x'
+      project-path: './src/MyApp/MyApp.csproj'
+      configuration: 'Release'
+      artifact-name: 'dotnet-build-artifact'
+      run-tests: true
+      test-project-path: './tests/**/*Tests.csproj'
+      # NuGet configuration
+      nuget-source-url: 'https://nexus.example.com/repository/nuget-group/'  # Optional: private feed
+      nuget-config-path: './NuGet.config'  # Optional: custom config
+      create-nuget-package: true
+      nuget-include-symbols: true
+      nuget-include-source: false
+    secrets:
+      NUGET_AUTH_TOKEN: ${{ secrets.NUGET_AUTH_TOKEN }}
+
+  # ============================================
+  # Stage 2: Security Scans (Parallel)
+  # Using composite actions for reusability
+  # ============================================
+  veracode-scan:
+    needs: build
+    uses: ./.github/workflows/scan-veracode.yml
+    with:
+      artifact-name: 'dotnet-build-artifact'
+      application-name: ${{ github.event.repository.name }}
+      scan-type: ${{ github.ref == 'refs/heads/main' && 'policy' || 'sandbox' }}
+      fail-on-severity: 'High'
+    secrets:
+      VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+      VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+
+  nexus-iq-scan:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dotnet-build-artifact
+          path: ./artifact
+
+      - name: Run Nexus IQ Scan
+        uses: ./.github/actions/nexus-iq-scan
+        with:
+          nexus-iq-url: ${{ secrets.NEXUS_IQ_URL }}
+          nexus-iq-username: ${{ secrets.NEXUS_IQ_USERNAME }}
+          nexus-iq-password: ${{ secrets.NEXUS_IQ_PASSWORD }}
+          application-id: ${{ github.event.repository.name }}
+          scan-targets: './artifact'
+          stage: ${{ github.ref == 'refs/heads/main' && 'release' || 'build' }}
+          fail-on-policy-warnings: false
+
+  # ============================================
+  # Stage 3: Publish to Nexus (Stage)
+  # Using composite action for publishing
+  # ============================================
+  publish-staging:
+    needs: [build, veracode-scan, nexus-iq-scan]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download NuGet packages
+        uses: actions/download-artifact@v4
+        with:
+          name: dotnet-build-artifact-nuget
+          path: ./nupkg
+
+      - name: Publish to Nexus
+        uses: ./.github/actions/nexus-publish
+        with:
+          nexus-url: ${{ secrets.NEXUS_URL }}
+          nexus-username: ${{ secrets.NEXUS_USERNAME }}
+          nexus-password: ${{ secrets.NEXUS_PASSWORD }}
+          repository-format: 'nuget'
+          repository-name: ${{ github.ref == 'refs/heads/main' && 'nuget-releases' || 'nuget-snapshots' }}
+          artifact-path: './nupkg'
+          artifact-id: 'MyApp'
+          version: ${{ needs.build.outputs.version }}
+
+  # ============================================
+  # Summary Job
+  # ============================================
+  pipeline-summary:
+    needs: [build, veracode-scan, nexus-iq-scan, publish-staging]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pipeline Summary
+        run: |
+          echo "## 🚀 .NET Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Veracode Scan | ${{ needs.veracode-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Nexus IQ Scan | ${{ needs.nexus-iq-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Publish Staging | ${{ needs.publish-staging.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ needs.build.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**NuGet Package:** ${{ needs.build.outputs.nuget-package-path }}" >> $GITHUB_STEP_SUMMARY

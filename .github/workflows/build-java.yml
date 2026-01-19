@@ -1,0 +1,144 @@
+name: Build Java Application
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: 'Java version'
+        required: false
+        type: string
+        default: '17'
+      java-distribution:
+        description: 'Java distribution (temurin, corretto, zulu, etc.)'
+        required: false
+        type: string
+        default: 'temurin'
+      build-tool:
+        description: 'Build tool (maven or gradle)'
+        required: false
+        type: string
+        default: 'maven'
+      pom-path:
+        description: 'Path to pom.xml (Maven) or build.gradle (Gradle)'
+        required: false
+        type: string
+        default: 'pom.xml'
+      artifact-name:
+        description: 'Name for the build artifact'
+        required: true
+        type: string
+      run-tests:
+        description: 'Run unit tests'
+        required: false
+        type: boolean
+        default: true
+      maven-goals:
+        description: 'Maven goals to execute'
+        required: false
+        type: string
+        default: 'clean package'
+      gradle-tasks:
+        description: 'Gradle tasks to execute'
+        required: false
+        type: string
+        default: 'clean build'
+    outputs:
+      artifact-path:
+        description: 'Path to the built artifact'
+        value: ${{ jobs.build.outputs.artifact-path }}
+      version:
+        description: 'Build version'
+        value: ${{ jobs.build.outputs.version }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-path: ${{ steps.package.outputs.artifact-path }}
+      version: ${{ steps.version.outputs.version }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ inputs.java-distribution }}
+          java-version: ${{ inputs.java-version }}
+          cache: ${{ inputs.build-tool }}
+
+      - name: Generate version
+        id: version
+        run: |
+          VERSION="1.0.0-SNAPSHOT"
+          if [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == "refs/heads/master" ]]; then
+            VERSION="1.0.${{ github.run_number }}"
+          else
+            VERSION="1.0.0-${{ github.run_number }}-SNAPSHOT"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Generated version: $VERSION"
+
+      - name: Build with Maven
+        if: inputs.build-tool == 'maven'
+        run: |
+          SKIP_TESTS=""
+          if [[ "${{ inputs.run-tests }}" != "true" ]]; then
+            SKIP_TESTS="-DskipTests"
+          fi
+          mvn -B -f ${{ inputs.pom-path }} ${{ inputs.maven-goals }} \
+            -Drevision=${{ steps.version.outputs.version }} \
+            $SKIP_TESTS
+
+      - name: Build with Gradle
+        if: inputs.build-tool == 'gradle'
+        run: |
+          SKIP_TESTS=""
+          if [[ "${{ inputs.run-tests }}" != "true" ]]; then
+            SKIP_TESTS="-x test"
+          fi
+          ./gradlew ${{ inputs.gradle-tasks }} \
+            -Pversion=${{ steps.version.outputs.version }} \
+            $SKIP_TESTS
+
+      - name: Upload test results (Maven)
+        if: inputs.run-tests && inputs.build-tool == 'maven' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-java
+          path: '**/target/surefire-reports/*.xml'
+          retention-days: 7
+
+      - name: Upload test results (Gradle)
+        if: inputs.run-tests && inputs.build-tool == 'gradle' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-java
+          path: '**/build/test-results/**/*.xml'
+          retention-days: 7
+
+      - name: Package artifacts
+        id: package
+        run: |
+          mkdir -p ./artifacts
+          
+          if [[ "${{ inputs.build-tool }}" == "maven" ]]; then
+            find . -path "*/target/*.jar" -not -name "*-sources.jar" -not -name "*-javadoc.jar" -exec cp {} ./artifacts/ \;
+            find . -path "*/target/*.war" -exec cp {} ./artifacts/ \; 2>/dev/null || true
+          else
+            find . -path "*/build/libs/*.jar" -not -name "*-sources.jar" -not -name "*-javadoc.jar" -exec cp {} ./artifacts/ \;
+          fi
+          
+          cd artifacts
+          zip -r ../build-artifacts.zip .
+          echo "artifact-path=$(pwd)/../build-artifacts.zip" >> $GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ./build-artifacts.zip
+          retention-days: 5

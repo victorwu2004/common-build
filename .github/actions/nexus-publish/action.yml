@@ -1,0 +1,428 @@
+name: 'Publish to Nexus Repository'
+description: 'Publish artifacts to Sonatype Nexus Repository Manager'
+author: 'Your Organization'
+
+branding:
+  icon: 'upload-cloud'
+  color: 'green'
+
+inputs:
+  nexus-url:
+    description: 'Nexus Repository server URL'
+    required: true
+  nexus-username:
+    description: 'Nexus username'
+    required: true
+  nexus-password:
+    description: 'Nexus password'
+    required: true
+  repository-format:
+    description: 'Repository format (maven, npm, pypi, nuget, raw)'
+    required: true
+  repository-name:
+    description: 'Target repository name in Nexus'
+    required: true
+  artifact-path:
+    description: 'Path to artifact file(s) to publish'
+    required: true
+  group-id:
+    description: 'Group ID (Maven) / Scope (npm) / Package name prefix'
+    required: false
+    default: ''
+  artifact-id:
+    description: 'Artifact ID / Package name'
+    required: true
+  version:
+    description: 'Version to publish'
+    required: true
+  classifier:
+    description: 'Maven classifier (optional)'
+    required: false
+    default: ''
+  extension:
+    description: 'File extension (jar, war, zip, tgz, nupkg, whl)'
+    required: false
+    default: ''
+  generate-pom:
+    description: 'Generate POM for Maven artifacts'
+    required: false
+    default: 'true'
+
+outputs:
+  published-url:
+    description: 'URL of the published artifact'
+    value: ${{ steps.publish.outputs.url }}
+  publish-status:
+    description: 'Publication status (success, failed)'
+    value: ${{ steps.publish.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate Inputs
+      shell: bash
+      run: |
+        echo "Validating inputs..."
+        
+        if [[ ! -e "${{ inputs.artifact-path }}" ]]; then
+          echo "::error::Artifact path does not exist: ${{ inputs.artifact-path }}"
+          exit 1
+        fi
+        
+        VALID_FORMATS="maven npm pypi nuget raw"
+        if [[ ! " $VALID_FORMATS " =~ " ${{ inputs.repository-format }} " ]]; then
+          echo "::error::Invalid repository format: ${{ inputs.repository-format }}. Must be one of: $VALID_FORMATS"
+          exit 1
+        fi
+        
+        echo "Inputs validated successfully"
+
+    - name: Setup Node.js (for npm)
+      if: inputs.repository-format == 'npm'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Setup Python (for PyPI)
+      if: inputs.repository-format == 'pypi'
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Setup .NET (for NuGet)
+      if: inputs.repository-format == 'nuget'
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+
+    - name: Publish to Maven Repository
+      id: publish-maven
+      if: inputs.repository-format == 'maven'
+      shell: bash
+      env:
+        NEXUS_URL: ${{ inputs.nexus-url }}
+        NEXUS_USERNAME: ${{ inputs.nexus-username }}
+        NEXUS_PASSWORD: ${{ inputs.nexus-password }}
+      run: |
+        GROUP_ID="${{ inputs.group-id }}"
+        ARTIFACT_ID="${{ inputs.artifact-id }}"
+        VERSION="${{ inputs.version }}"
+        CLASSIFIER="${{ inputs.classifier }}"
+        REPO="${{ inputs.repository-name }}"
+        
+        # Convert group ID to path
+        GROUP_PATH=$(echo "$GROUP_ID" | tr '.' '/')
+        
+        # Find artifact file
+        ARTIFACT_FILE="${{ inputs.artifact-path }}"
+        
+        # Determine extension
+        if [[ -n "${{ inputs.extension }}" ]]; then
+          EXTENSION="${{ inputs.extension }}"
+        else
+          EXTENSION="${ARTIFACT_FILE##*.}"
+        fi
+        
+        # Build base URL path
+        BASE_PATH="${NEXUS_URL}/repository/${REPO}/${GROUP_PATH}/${ARTIFACT_ID}/${VERSION}"
+        
+        # Build filename
+        FILENAME="${ARTIFACT_ID}-${VERSION}"
+        if [[ -n "$CLASSIFIER" ]]; then
+          FILENAME="${FILENAME}-${CLASSIFIER}"
+        fi
+        FILENAME="${FILENAME}.${EXTENSION}"
+        
+        UPLOAD_URL="${BASE_PATH}/${FILENAME}"
+        
+        echo "Publishing to Maven repository..."
+        echo "  URL: $UPLOAD_URL"
+        
+        # Upload artifact
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+          -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+          --upload-file "$ARTIFACT_FILE" \
+          "$UPLOAD_URL")
+        
+        if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]]; then
+          echo "url=$UPLOAD_URL" >> $GITHUB_OUTPUT
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "✅ Successfully published to: $UPLOAD_URL"
+        else
+          echo "::error::Failed to publish artifact. HTTP status: $HTTP_STATUS"
+          echo "status=failed" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        
+        # Generate and upload POM if requested
+        if [[ "${{ inputs.generate-pom }}" == "true" ]]; then
+          POM_FILE="${{ runner.temp }}/pom.xml"
+          cat > "$POM_FILE" << EOF
+        <?xml version="1.0" encoding="UTF-8"?>
+        <project xmlns="http://maven.apache.org/POM/4.0.0"
+                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                 xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>${GROUP_ID}</groupId>
+            <artifactId>${ARTIFACT_ID}</artifactId>
+            <version>${VERSION}</version>
+            <packaging>${EXTENSION}</packaging>
+        </project>
+        EOF
+          
+          POM_URL="${BASE_PATH}/${ARTIFACT_ID}-${VERSION}.pom"
+          curl -s -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+            --upload-file "$POM_FILE" \
+            "$POM_URL"
+          echo "POM uploaded to: $POM_URL"
+        fi
+
+    - name: Publish to npm Repository
+      id: publish-npm
+      if: inputs.repository-format == 'npm'
+      shell: bash
+      env:
+        NEXUS_URL: ${{ inputs.nexus-url }}
+        NEXUS_USERNAME: ${{ inputs.nexus-username }}
+        NEXUS_PASSWORD: ${{ inputs.nexus-password }}
+      run: |
+        REPO="${{ inputs.repository-name }}"
+        SCOPE="${{ inputs.group-id }}"
+        PKG_NAME="${{ inputs.artifact-id }}"
+        VERSION="${{ inputs.version }}"
+        
+        # Extract registry host
+        REGISTRY_URL="${NEXUS_URL}/repository/${REPO}/"
+        REGISTRY_HOST=$(echo "$NEXUS_URL" | sed 's|https://||' | sed 's|http://||')
+        
+        # Configure npm
+        npm config set registry "$REGISTRY_URL"
+        
+        # Set auth token
+        AUTH_TOKEN=$(echo -n "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" | base64)
+        npm config set "//${REGISTRY_HOST}/repository/${REPO}/:_auth" "$AUTH_TOKEN"
+        
+        # Change to artifact directory
+        ARTIFACT_PATH="${{ inputs.artifact-path }}"
+        
+        if [[ -d "$ARTIFACT_PATH" ]]; then
+          cd "$ARTIFACT_PATH"
+        elif [[ -f "$ARTIFACT_PATH" ]] && [[ "$ARTIFACT_PATH" == *.tgz ]]; then
+          # Publish tarball directly
+          npm publish "$ARTIFACT_PATH" --registry "$REGISTRY_URL"
+          
+          if [[ -n "$SCOPE" ]]; then
+            PUBLISHED_URL="${REGISTRY_URL}${SCOPE}/${PKG_NAME}/-/${PKG_NAME}-${VERSION}.tgz"
+          else
+            PUBLISHED_URL="${REGISTRY_URL}${PKG_NAME}/-/${PKG_NAME}-${VERSION}.tgz"
+          fi
+          
+          echo "url=$PUBLISHED_URL" >> $GITHUB_OUTPUT
+          echo "status=success" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # Update version if package.json exists
+        if [[ -f "package.json" ]]; then
+          npm version "$VERSION" --no-git-tag-version --allow-same-version 2>/dev/null || true
+          npm publish --registry "$REGISTRY_URL"
+        fi
+        
+        if [[ -n "$SCOPE" ]]; then
+          PUBLISHED_URL="${REGISTRY_URL}${SCOPE}/${PKG_NAME}/-/${PKG_NAME}-${VERSION}.tgz"
+        else
+          PUBLISHED_URL="${REGISTRY_URL}${PKG_NAME}/-/${PKG_NAME}-${VERSION}.tgz"
+        fi
+        
+        echo "url=$PUBLISHED_URL" >> $GITHUB_OUTPUT
+        echo "status=success" >> $GITHUB_OUTPUT
+        echo "✅ Successfully published to: $PUBLISHED_URL"
+
+    - name: Publish to PyPI Repository
+      id: publish-pypi
+      if: inputs.repository-format == 'pypi'
+      shell: bash
+      env:
+        NEXUS_URL: ${{ inputs.nexus-url }}
+        NEXUS_USERNAME: ${{ inputs.nexus-username }}
+        NEXUS_PASSWORD: ${{ inputs.nexus-password }}
+      run: |
+        pip install twine
+        
+        REPO="${{ inputs.repository-name }}"
+        ARTIFACT_PATH="${{ inputs.artifact-path }}"
+        PKG_NAME="${{ inputs.artifact-id }}"
+        VERSION="${{ inputs.version }}"
+        
+        REPO_URL="${NEXUS_URL}/repository/${REPO}/"
+        
+        echo "Publishing to PyPI repository..."
+        
+        # Find distribution files
+        if [[ -d "$ARTIFACT_PATH" ]]; then
+          DIST_FILES=$(find "$ARTIFACT_PATH" -name "*.whl" -o -name "*.tar.gz" | tr '\n' ' ')
+        else
+          DIST_FILES="$ARTIFACT_PATH"
+        fi
+        
+        if [[ -z "$DIST_FILES" ]]; then
+          echo "::error::No distribution files found"
+          exit 1
+        fi
+        
+        # Upload using twine
+        twine upload \
+          --repository-url "$REPO_URL" \
+          --username "${NEXUS_USERNAME}" \
+          --password "${NEXUS_PASSWORD}" \
+          $DIST_FILES
+        
+        PUBLISHED_URL="${REPO_URL}simple/${PKG_NAME}/"
+        
+        echo "url=$PUBLISHED_URL" >> $GITHUB_OUTPUT
+        echo "status=success" >> $GITHUB_OUTPUT
+        echo "✅ Successfully published to: $PUBLISHED_URL"
+
+    - name: Publish to NuGet Repository
+      id: publish-nuget
+      if: inputs.repository-format == 'nuget'
+      shell: bash
+      env:
+        NEXUS_URL: ${{ inputs.nexus-url }}
+        NEXUS_USERNAME: ${{ inputs.nexus-username }}
+        NEXUS_PASSWORD: ${{ inputs.nexus-password }}
+      run: |
+        REPO="${{ inputs.repository-name }}"
+        ARTIFACT_PATH="${{ inputs.artifact-path }}"
+        PKG_NAME="${{ inputs.artifact-id }}"
+        VERSION="${{ inputs.version }}"
+        
+        REPO_URL="${NEXUS_URL}/repository/${REPO}/"
+        
+        echo "Publishing to NuGet repository..."
+        
+        # Find nupkg file
+        if [[ -d "$ARTIFACT_PATH" ]]; then
+          NUPKG_FILE=$(find "$ARTIFACT_PATH" -name "*.nupkg" -not -name "*.symbols.nupkg" | head -1)
+        else
+          NUPKG_FILE="$ARTIFACT_PATH"
+        fi
+        
+        if [[ -z "$NUPKG_FILE" ]] || [[ ! -f "$NUPKG_FILE" ]]; then
+          echo "::error::No .nupkg file found"
+          exit 1
+        fi
+        
+        echo "Found package: $NUPKG_FILE"
+        
+        # Add source and push
+        dotnet nuget add source "$REPO_URL" \
+          --name "nexus" \
+          --username "${NEXUS_USERNAME}" \
+          --password "${NEXUS_PASSWORD}" \
+          --store-password-in-clear-text 2>/dev/null || true
+        
+        dotnet nuget push "$NUPKG_FILE" \
+          --source "nexus" \
+          --skip-duplicate
+        
+        PUBLISHED_URL="${REPO_URL}${PKG_NAME}/${VERSION}"
+        
+        echo "url=$PUBLISHED_URL" >> $GITHUB_OUTPUT
+        echo "status=success" >> $GITHUB_OUTPUT
+        echo "✅ Successfully published to: $PUBLISHED_URL"
+
+    - name: Publish to Raw Repository
+      id: publish-raw
+      if: inputs.repository-format == 'raw'
+      shell: bash
+      env:
+        NEXUS_URL: ${{ inputs.nexus-url }}
+        NEXUS_USERNAME: ${{ inputs.nexus-username }}
+        NEXUS_PASSWORD: ${{ inputs.nexus-password }}
+      run: |
+        REPO="${{ inputs.repository-name }}"
+        GROUP="${{ inputs.group-id }}"
+        ARTIFACT_ID="${{ inputs.artifact-id }}"
+        VERSION="${{ inputs.version }}"
+        ARTIFACT_PATH="${{ inputs.artifact-path }}"
+        
+        # Get filename
+        FILENAME=$(basename "$ARTIFACT_PATH")
+        
+        # Build path
+        if [[ -n "$GROUP" ]]; then
+          UPLOAD_PATH="${GROUP}/${ARTIFACT_ID}/${VERSION}/${FILENAME}"
+        else
+          UPLOAD_PATH="${ARTIFACT_ID}/${VERSION}/${FILENAME}"
+        fi
+        
+        UPLOAD_URL="${NEXUS_URL}/repository/${REPO}/${UPLOAD_PATH}"
+        
+        echo "Publishing to Raw repository..."
+        echo "  URL: $UPLOAD_URL"
+        
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+          -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+          --upload-file "$ARTIFACT_PATH" \
+          "$UPLOAD_URL")
+        
+        if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]]; then
+          echo "url=$UPLOAD_URL" >> $GITHUB_OUTPUT
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "✅ Successfully published to: $UPLOAD_URL"
+        else
+          echo "::error::Failed to publish artifact. HTTP status: $HTTP_STATUS"
+          echo "status=failed" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+
+    - name: Set Combined Output
+      id: publish
+      shell: bash
+      run: |
+        # Combine outputs from format-specific steps
+        case "${{ inputs.repository-format }}" in
+          maven)
+            echo "url=${{ steps.publish-maven.outputs.url }}" >> $GITHUB_OUTPUT
+            echo "status=${{ steps.publish-maven.outputs.status }}" >> $GITHUB_OUTPUT
+            URL="${{ steps.publish-maven.outputs.url }}"
+            STATUS="${{ steps.publish-maven.outputs.status }}"
+            ;;
+          npm)
+            echo "url=${{ steps.publish-npm.outputs.url }}" >> $GITHUB_OUTPUT
+            echo "status=${{ steps.publish-npm.outputs.status }}" >> $GITHUB_OUTPUT
+            URL="${{ steps.publish-npm.outputs.url }}"
+            STATUS="${{ steps.publish-npm.outputs.status }}"
+            ;;
+          pypi)
+            echo "url=${{ steps.publish-pypi.outputs.url }}" >> $GITHUB_OUTPUT
+            echo "status=${{ steps.publish-pypi.outputs.status }}" >> $GITHUB_OUTPUT
+            URL="${{ steps.publish-pypi.outputs.url }}"
+            STATUS="${{ steps.publish-pypi.outputs.status }}"
+            ;;
+          nuget)
+            echo "url=${{ steps.publish-nuget.outputs.url }}" >> $GITHUB_OUTPUT
+            echo "status=${{ steps.publish-nuget.outputs.status }}" >> $GITHUB_OUTPUT
+            URL="${{ steps.publish-nuget.outputs.url }}"
+            STATUS="${{ steps.publish-nuget.outputs.status }}"
+            ;;
+          raw)
+            echo "url=${{ steps.publish-raw.outputs.url }}" >> $GITHUB_OUTPUT
+            echo "status=${{ steps.publish-raw.outputs.status }}" >> $GITHUB_OUTPUT
+            URL="${{ steps.publish-raw.outputs.url }}"
+            STATUS="${{ steps.publish-raw.outputs.status }}"
+            ;;
+        esac
+        
+        # Create summary
+        echo "## 📦 Nexus Publication Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Repository | ${{ inputs.repository-name }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Format | ${{ inputs.repository-format }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Artifact | ${{ inputs.artifact-id }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Version | ${{ inputs.version }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Status | $STATUS |" >> $GITHUB_STEP_SUMMARY
+        echo "| URL | [$URL]($URL) |" >> $GITHUB_STEP_SUMMARY

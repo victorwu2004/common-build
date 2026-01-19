@@ -1,0 +1,195 @@
+name: 'Nexus IQ Security Scan'
+description: 'Scan artifacts for security vulnerabilities using Sonatype Nexus IQ'
+author: 'Your Organization'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  nexus-iq-url:
+    description: 'Nexus IQ server URL'
+    required: true
+  nexus-iq-username:
+    description: 'Nexus IQ username'
+    required: true
+  nexus-iq-password:
+    description: 'Nexus IQ password'
+    required: true
+  application-id:
+    description: 'Nexus IQ application ID'
+    required: true
+  scan-targets:
+    description: 'Path to files/directories to scan'
+    required: true
+    default: '.'
+  stage:
+    description: 'Nexus IQ stage (develop, build, stage-release, release, operate)'
+    required: false
+    default: 'build'
+  fail-on-policy-warnings:
+    description: 'Fail the build on policy warnings'
+    required: false
+    default: 'false'
+  result-file:
+    description: 'Path to save scan results JSON'
+    required: false
+    default: 'nexus-iq-results.json'
+  java-version:
+    description: 'Java version for Nexus IQ CLI'
+    required: false
+    default: '17'
+
+outputs:
+  scan-status:
+    description: 'Scan completion status (success, failed, warning)'
+    value: ${{ steps.evaluate.outputs.status }}
+  policy-action:
+    description: 'Policy action result (None, Warn, Fail)'
+    value: ${{ steps.evaluate.outputs.policy-action }}
+  report-url:
+    description: 'URL to the scan report'
+    value: ${{ steps.evaluate.outputs.report-url }}
+  critical-count:
+    description: 'Number of critical vulnerabilities'
+    value: ${{ steps.evaluate.outputs.critical-count }}
+  severe-count:
+    description: 'Number of severe vulnerabilities'
+    value: ${{ steps.evaluate.outputs.severe-count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: ${{ inputs.java-version }}
+
+    - name: Download Nexus IQ CLI
+      shell: bash
+      run: |
+        NEXUS_IQ_CLI_VERSION="1.174.0-01"
+        echo "Downloading Nexus IQ CLI version ${NEXUS_IQ_CLI_VERSION}..."
+        curl -sL -o "${{ runner.temp }}/nexus-iq-cli.jar" \
+          "https://download.sonatype.com/clm/scanner/nexus-iq-cli-${NEXUS_IQ_CLI_VERSION}.jar"
+        echo "Download complete"
+
+    - name: Run Nexus IQ Scan
+      id: scan
+      shell: bash
+      env:
+        NEXUS_IQ_URL: ${{ inputs.nexus-iq-url }}
+        NEXUS_IQ_USERNAME: ${{ inputs.nexus-iq-username }}
+        NEXUS_IQ_PASSWORD: ${{ inputs.nexus-iq-password }}
+      run: |
+        echo "Starting Nexus IQ scan..."
+        echo "Application ID: ${{ inputs.application-id }}"
+        echo "Stage: ${{ inputs.stage }}"
+        echo "Scan targets: ${{ inputs.scan-targets }}"
+        
+        # Build scan command
+        SCAN_CMD="java -jar ${{ runner.temp }}/nexus-iq-cli.jar"
+        SCAN_CMD="$SCAN_CMD -s ${NEXUS_IQ_URL}"
+        SCAN_CMD="$SCAN_CMD -a ${NEXUS_IQ_USERNAME}:${NEXUS_IQ_PASSWORD}"
+        SCAN_CMD="$SCAN_CMD -i ${{ inputs.application-id }}"
+        SCAN_CMD="$SCAN_CMD -t ${{ inputs.stage }}"
+        SCAN_CMD="$SCAN_CMD -r ${{ inputs.result-file }}"
+        SCAN_CMD="$SCAN_CMD ${{ inputs.scan-targets }}"
+        
+        # Run scan and capture exit code
+        set +e
+        $SCAN_CMD 2>&1 | tee scan-output.log
+        SCAN_EXIT_CODE=$?
+        set -e
+        
+        echo "scan-exit-code=$SCAN_EXIT_CODE" >> $GITHUB_OUTPUT
+        
+        # Parse results if available
+        if [[ -f "${{ inputs.result-file }}" ]]; then
+          REPORT_URL=$(cat "${{ inputs.result-file }}" | jq -r '.reportHtmlUrl // "N/A"')
+          POLICY_ACTION=$(cat "${{ inputs.result-file }}" | jq -r '.policyAction // "None"')
+          
+          # Extract vulnerability counts if available
+          CRITICAL_COUNT=$(cat "${{ inputs.result-file }}" | jq -r '.criticalComponentCount // 0')
+          SEVERE_COUNT=$(cat "${{ inputs.result-file }}" | jq -r '.severeComponentCount // 0')
+        else
+          REPORT_URL="N/A"
+          POLICY_ACTION="Unknown"
+          CRITICAL_COUNT="0"
+          SEVERE_COUNT="0"
+        fi
+        
+        echo "report-url=$REPORT_URL" >> $GITHUB_OUTPUT
+        echo "policy-action=$POLICY_ACTION" >> $GITHUB_OUTPUT
+        echo "critical-count=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+        echo "severe-count=$SEVERE_COUNT" >> $GITHUB_OUTPUT
+        
+        echo "Scan completed"
+        echo "  Exit code: $SCAN_EXIT_CODE"
+        echo "  Policy Action: $POLICY_ACTION"
+        echo "  Report URL: $REPORT_URL"
+
+    - name: Evaluate Results
+      id: evaluate
+      shell: bash
+      run: |
+        EXIT_CODE="${{ steps.scan.outputs.scan-exit-code }}"
+        POLICY_ACTION="${{ steps.scan.outputs.policy-action }}"
+        REPORT_URL="${{ steps.scan.outputs.report-url }}"
+        CRITICAL_COUNT="${{ steps.scan.outputs.critical-count }}"
+        SEVERE_COUNT="${{ steps.scan.outputs.severe-count }}"
+        
+        STATUS="success"
+        
+        # Determine status based on exit code and policy
+        if [[ "$EXIT_CODE" -ne 0 ]]; then
+          if [[ "$POLICY_ACTION" == "Fail" ]]; then
+            echo "::error::Nexus IQ scan failed due to policy violations"
+            STATUS="failed"
+          elif [[ "$POLICY_ACTION" == "Warn" ]]; then
+            if [[ "${{ inputs.fail-on-policy-warnings }}" == "true" ]]; then
+              echo "::error::Nexus IQ scan has policy warnings (configured to fail on warnings)"
+              STATUS="failed"
+            else
+              echo "::warning::Nexus IQ scan completed with policy warnings"
+              STATUS="warning"
+            fi
+          fi
+        fi
+        
+        echo "status=$STATUS" >> $GITHUB_OUTPUT
+        echo "policy-action=$POLICY_ACTION" >> $GITHUB_OUTPUT
+        echo "report-url=$REPORT_URL" >> $GITHUB_OUTPUT
+        echo "critical-count=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+        echo "severe-count=$SEVERE_COUNT" >> $GITHUB_OUTPUT
+        
+        # Create summary
+        echo "## 🔍 Nexus IQ Scan Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Application | ${{ inputs.application-id }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Stage | ${{ inputs.stage }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Status | $STATUS |" >> $GITHUB_STEP_SUMMARY
+        echo "| Policy Action | $POLICY_ACTION |" >> $GITHUB_STEP_SUMMARY
+        echo "| Critical Issues | $CRITICAL_COUNT |" >> $GITHUB_STEP_SUMMARY
+        echo "| Severe Issues | $SEVERE_COUNT |" >> $GITHUB_STEP_SUMMARY
+        echo "| Report | [$REPORT_URL]($REPORT_URL) |" >> $GITHUB_STEP_SUMMARY
+
+    - name: Upload Scan Results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: nexus-iq-scan-results
+        path: |
+          ${{ inputs.result-file }}
+          scan-output.log
+        retention-days: 30
+
+    - name: Fail on Policy Violation
+      if: steps.evaluate.outputs.status == 'failed'
+      shell: bash
+      run: |
+        echo "Nexus IQ scan failed. See report: ${{ steps.evaluate.outputs.report-url }}"
+        exit 1
