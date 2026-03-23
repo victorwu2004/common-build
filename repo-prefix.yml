@@ -1,0 +1,82 @@
+name: Repo Prefix Demo
+
+# ============================================================
+# Demonstrates extracting the first 3 letters of the GitHub
+# repository name using PowerShell, then passing that value:
+#   - to subsequent steps within the same job
+#   - to downstream jobs via job outputs
+# ============================================================
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+
+  # ------------------------------------------------------------
+  # Job 1: Extract the repo prefix and expose it as a job output
+  # ------------------------------------------------------------
+  extract-prefix:
+    name: Extract Repo Prefix
+    runs-on: [self-hosted, windows]
+
+    outputs:
+      # Expose the step output as a job-level output so downstream
+      # jobs can consume it via needs.extract-prefix.outputs.repo_prefix
+      repo_prefix: ${{ steps.get-prefix.outputs.repo_prefix }}
+
+    steps:
+      - name: Get first 3 letters of repository name
+        id: get-prefix
+        shell: pwsh
+        run: |
+          # $env:GITHUB_REPOSITORY is "org/repo-name" — split on '/' and take the repo part
+          $repoFullName = $env:GITHUB_REPOSITORY
+          $repoName     = $repoFullName.Split('/')[1]
+
+          # Safely extract the first 3 characters
+          $prefix = $repoName.Substring(0, [Math]::Min(3, $repoName.Length)).ToLower()
+
+          Write-Host "Repository : $repoFullName"
+          Write-Host "Repo name  : $repoName"
+          Write-Host "Prefix     : $prefix"
+
+          # Write to GITHUB_OUTPUT — available to all later steps in this job
+          "repo_prefix=$prefix" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      # --------------------------------------------------------
+      # Any subsequent step in the same job reads the output via:
+      #   ${{ steps.get-prefix.outputs.repo_prefix }}
+      # --------------------------------------------------------
+      - name: Use prefix in the same job
+        shell: pwsh
+        run: |
+          $prefix = "${{ steps.get-prefix.outputs.repo_prefix }}"
+          Write-Host "Same-job usage → prefix is: $prefix"
+
+          # Example: construct a deployment tag
+          $tag = "$prefix-${{ github.run_number }}"
+          Write-Host "Deployment tag: $tag"
+
+  # ------------------------------------------------------------
+  # Job 2: Consume the prefix from Job 1
+  # ------------------------------------------------------------
+  use-prefix:
+    name: Use Repo Prefix (downstream job)
+    runs-on: [self-hosted, windows]
+    needs: [extract-prefix]
+
+    steps:
+      - name: Read prefix passed from extract-prefix job
+        shell: pwsh
+        run: |
+          # Downstream jobs read the value via needs.<job-id>.outputs.<output-name>
+          $prefix = "${{ needs.extract-prefix.outputs.repo_prefix }}"
+          Write-Host "Downstream job received prefix: $prefix"
+
+          # Example: use it to name an Ansible inventory group or artifact path
+          $inventoryGroup = "$prefix-servers"
+          $artifactPath   = "$prefix/${{ github.run_number }}/app.war"
+
+          Write-Host "Inventory group : $inventoryGroup"
+          Write-Host "Artifact path   : $artifactPath"

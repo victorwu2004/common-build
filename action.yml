@@ -1,0 +1,707 @@
+# =============================================================================
+# Composite Action: veracode-scan
+# Path: .github/actions/veracode-scan/action.yml
+#
+# Full lifecycle:
+#   1. Fetch JAR from Nexus (or Maven Central fallback)
+#   2. Pre-flight: resolve app_id / sandbox_id via JAR, inspect build status,
+#      delete stale/failed build if policy allows
+#   3. Upload and Scan via JAR  (uploadandscan action)
+#   4. Optional wait-for-results polling loop via getbuildinfo JAR action
+#   5. Structured outputs + summary step annotation
+#
+# Supported scan modes:
+#   - Policy scan  (sandbox_name = "")
+#   - Sandbox scan (sandbox_name = "<name>")
+#
+# Stale build handling (preflight_mode input):
+#   safe   - delete only: Incomplete | No Modules Defined | Prescan Failed
+#   force  - delete any non-Results-Ready build (adds Prescan Submitted,
+#            Prescan Success, Scan In Process)
+#   none   - never delete; fail fast with clear message
+# =============================================================================
+
+name: 'Veracode Upload and Scan (JAR)'
+description: >
+  Downloads the Veracode Java API wrapper JAR, runs a pre-flight stale-build
+  check with optional delete, executes uploadandscan, and optionally polls for
+  results — all without delegating to the marketplace action.
+
+# ---------------------------------------------------------------------------
+# INPUTS
+# ---------------------------------------------------------------------------
+inputs:
+
+  # --- Identity ---
+  vid:
+    description: 'Veracode API ID'
+    required: true
+  vkey:
+    description: 'Veracode API Key'
+    required: true
+
+  # --- Application targeting ---
+  app_name:
+    description: 'Veracode application profile name (must already exist unless create_profile=true)'
+    required: true
+  create_profile:
+    description: 'Create the application profile if it does not exist'
+    required: false
+    default: 'false'
+  sandbox_name:
+    description: 'Sandbox name for a sandbox scan. Leave empty for a policy scan.'
+    required: false
+    default: ''
+  create_sandbox:
+    description: 'Create the sandbox if it does not exist (only used when sandbox_name is set)'
+    required: false
+    default: 'true'
+
+  # --- Artifact ---
+  artifact_path:
+    description: 'Absolute or workspace-relative path to the ZIP/JAR/WAR to upload'
+    required: true
+
+  # --- Scan options ---
+  scan_version:
+    description: >
+      Build/version label shown in the Veracode platform.
+      Defaults to "GHA-<run_id>-<run_attempt>".
+    required: false
+    default: ''
+  include_modules:
+    description: 'Comma-separated module name patterns to include (supports * and ?)'
+    required: false
+    default: ''
+  exclude_modules:
+    description: 'Comma-separated module name patterns to exclude (supports * and ?)'
+    required: false
+    default: ''
+  scan_all_nonfatal_top_level_modules:
+    description: 'Pass -scanallnonfataltoplevelmodules true to the JAR'
+    required: false
+    default: 'false'
+  selected_previously:
+    description: 'Re-use module selection from the previous scan'
+    required: false
+    default: 'false'
+  top_level:
+    description: 'Scan only top-level modules'
+    required: false
+    default: 'false'
+  criticality:
+    description: 'App criticality when creating a new profile (VeryHigh|High|Medium|Low|VeryLow)'
+    required: false
+    default: 'High'
+
+  # --- Pre-flight stale build handling ---
+  preflight_mode:
+    description: |
+      safe   - delete Incomplete | No Modules Defined | Prescan Failed builds
+      force  - delete any build that is not Results Ready
+      none   - never delete; fail the action if a blocking build is found
+    required: false
+    default: 'safe'
+
+  # --- Wait for results ---
+  wait_for_results:
+    description: >
+      Poll getbuildinfo until status = "Results Ready".
+      Required to get a pass/fail policy outcome in the same job.
+      Set false to fire-and-forget (scan runs asynchronously).
+    required: false
+    default: 'true'
+  scan_timeout_minutes:
+    description: >
+      Maximum minutes to wait for Results Ready before failing.
+      0 = unlimited (wait forever). Only used when wait_for_results=true.
+    required: false
+    default: '60'
+  poll_interval_seconds:
+    description: 'Seconds between getbuildinfo polls. Min 30, max 120 per Veracode guidance.'
+    required: false
+    default: '60'
+
+  # --- JAR acquisition ---
+  jar_version:
+    description: >
+      Pinned version of vosp-api-wrappers-java (e.g. 23.6.12.0).
+      Leave empty to resolve "latest" from Nexus/Maven metadata.
+    required: false
+    default: ''
+  nexus_jar_base_url:
+    description: >
+      Base URL of your Nexus Maven proxy for Maven Central.
+      Example: https://nexus.corp.example.com/repository/maven-central
+      Leave empty to download directly from Maven Central.
+    required: false
+    default: ''
+  nexus_username:
+    description: 'Nexus username (only required when nexus_jar_base_url is set)'
+    required: false
+    default: ''
+  nexus_password:
+    description: 'Nexus password (only required when nexus_jar_base_url is set)'
+    required: false
+    default: ''
+
+  # --- Misc ---
+  debug:
+    description: 'Pass -debug true to the JAR for verbose output'
+    required: false
+    default: 'false'
+  max_retry_count:
+    description: 'JAR internal retry count for transient API errors (1-5)'
+    required: false
+    default: '3'
+  fail_on_policy_violation:
+    description: >
+      When wait_for_results=true: fail the action if the scan does not pass policy.
+      When wait_for_results=false: this has no effect (result is unknown at job time).
+    required: false
+    default: 'true'
+
+# ---------------------------------------------------------------------------
+# OUTPUTS
+# ---------------------------------------------------------------------------
+outputs:
+  app_id:
+    description: 'Veracode numeric application ID'
+    value: ${{ steps.preflight.outputs.app_id }}
+  sandbox_id:
+    description: 'Veracode numeric sandbox ID (empty for policy scans)'
+    value: ${{ steps.preflight.outputs.sandbox_id }}
+  preflight_status:
+    description: 'Build status found during pre-flight (e.g. Incomplete, Results Ready, no_build)'
+    value: ${{ steps.preflight.outputs.preflight_status }}
+  stale_build_deleted:
+    description: 'true if a stale build was deleted during pre-flight'
+    value: ${{ steps.preflight.outputs.stale_build_deleted }}
+  build_id:
+    description: 'Veracode build ID created by this scan run'
+    value: ${{ steps.wait-results.outputs.build_id }}
+  final_status:
+    description: 'Final Veracode build status after scan (Results Ready | Scan In Process | timed_out | skipped)'
+    value: ${{ steps.wait-results.outputs.final_status }}
+  policy_compliance:
+    description: 'Policy compliance result (Pass | Did Not Pass | Not Assessed | unknown)'
+    value: ${{ steps.wait-results.outputs.policy_compliance }}
+  scan_outcome:
+    description: >
+      Human-readable composite outcome:
+        submitted        - scan submitted, wait_for_results=false
+        results_ready    - scan completed, results available
+        policy_pass      - scan completed and passed policy
+        policy_fail      - scan completed but failed policy
+        timed_out        - polling exceeded scan_timeout_minutes
+        preflight_blocked - stale build found and preflight_mode=none
+        upload_failed    - JAR upload/scan step returned non-zero
+    value: ${{ steps.summarize.outputs.scan_outcome }}
+
+# ---------------------------------------------------------------------------
+# STEPS
+# ---------------------------------------------------------------------------
+runs:
+  using: composite
+  steps:
+
+    # =========================================================================
+    # STEP 1 — Acquire the Veracode Java API wrapper JAR
+    # =========================================================================
+    - name: Acquire Veracode JAR
+      id: get-jar
+      shell: bash
+      env:
+        JAR_VERSION:        ${{ inputs.jar_version }}
+        NEXUS_BASE:         ${{ inputs.nexus_jar_base_url }}
+        NEXUS_USER:         ${{ inputs.nexus_username }}
+        NEXUS_PASS:         ${{ inputs.nexus_password }}
+      run: |
+        set -euo pipefail
+        JAR_DIR="${{ github.action_path }}/lib"
+        mkdir -p "$JAR_DIR"
+        JAR_PATH="$JAR_DIR/VeracodeJavaAPI.jar"
+
+        MAVEN_CENTRAL="https://repo1.maven.org/maven2/com/veracode/vosp/api/wrappers/vosp-api-wrappers-java"
+        METADATA_URL="${MAVEN_CENTRAL}/maven-metadata.xml"
+
+        # --- Resolve version -----------------------------------------------
+        if [[ -z "$JAR_VERSION" ]]; then
+          echo "Resolving latest JAR version from metadata..."
+          if [[ -n "$NEXUS_BASE" ]]; then
+            META_URL="${NEXUS_BASE}/com/veracode/vosp/api/wrappers/vosp-api-wrappers-java/maven-metadata.xml"
+            CURL_AUTH=()
+            [[ -n "$NEXUS_USER" ]] && CURL_AUTH=(-u "${NEXUS_USER}:${NEXUS_PASS}")
+            JAR_VERSION=$(curl -fsSL "${CURL_AUTH[@]}" "$META_URL" \
+              | grep -oP '(?<=<latest>)[^<]+' | head -1)
+          else
+            JAR_VERSION=$(curl -fsSL "$METADATA_URL" \
+              | grep -oP '(?<=<latest>)[^<]+' | head -1)
+          fi
+          echo "Resolved JAR version: $JAR_VERSION"
+        else
+          echo "Using pinned JAR version: $JAR_VERSION"
+        fi
+
+        # --- Download JAR --------------------------------------------------
+        if [[ -n "$NEXUS_BASE" ]]; then
+          JAR_URL="${NEXUS_BASE}/com/veracode/vosp/api/wrappers/vosp-api-wrappers-java/${JAR_VERSION}/vosp-api-wrappers-java-${JAR_VERSION}-dist.jar"
+          CURL_AUTH=()
+          [[ -n "$NEXUS_USER" ]] && CURL_AUTH=(-u "${NEXUS_USER}:${NEXUS_PASS}")
+          echo "Downloading JAR from Nexus: $JAR_URL"
+          curl -fsSL "${CURL_AUTH[@]}" "$JAR_URL" -o "$JAR_PATH"
+        else
+          JAR_URL="${MAVEN_CENTRAL}/${JAR_VERSION}/vosp-api-wrappers-java-${JAR_VERSION}-dist.jar"
+          echo "Downloading JAR from Maven Central: $JAR_URL"
+          curl -fsSL "$JAR_URL" -o "$JAR_PATH"
+        fi
+
+        # Verify the JAR is valid
+        if ! java -jar "$JAR_PATH" -help > /dev/null 2>&1; then
+          echo "::error::Downloaded JAR failed basic smoke test. Check the version or URL."
+          exit 1
+        fi
+
+        echo "jar_path=$JAR_PATH"   >> "$GITHUB_OUTPUT"
+        echo "jar_version=$JAR_VERSION" >> "$GITHUB_OUTPUT"
+        echo "JAR acquired: $JAR_PATH (version $JAR_VERSION)"
+
+    # =========================================================================
+    # STEP 2 — Pre-flight: inspect build status, conditionally delete stale build
+    # =========================================================================
+    - name: Pre-flight build status check
+      id: preflight
+      shell: bash
+      env:
+        VERACODE_API_KEY_ID:     ${{ inputs.vid }}
+        VERACODE_API_KEY_SECRET: ${{ inputs.vkey }}
+        APP_NAME:                ${{ inputs.app_name }}
+        SANDBOX_NAME:            ${{ inputs.sandbox_name }}
+        PREFLIGHT_MODE:          ${{ inputs.preflight_mode }}
+        JAR_PATH:                ${{ steps.get-jar.outputs.jar_path }}
+      run: |
+        set -euo pipefail
+
+        JAR="$JAR_PATH"
+        # Common credential args — never echoed
+        CREDS=(-vid "$VERACODE_API_KEY_ID" -vkey "$VERACODE_API_KEY_SECRET")
+
+        echo "::group::Veracode Pre-flight for '$APP_NAME'"
+
+        # ---- Resolve app_id ------------------------------------------------
+        echo "Resolving app_id for '$APP_NAME'..."
+        APP_LIST=$(java -jar "$JAR" "${CREDS[@]}" -action GetAppList 2>&1)
+
+        # GetAppList returns XML; parse app_id with grep+sed
+        APP_ID=$(echo "$APP_LIST" \
+          | grep -oP "app_name=\"${APP_NAME}\"[^/]+" \
+          | grep -oP 'app_id="\K[0-9]+' \
+          || true)
+
+        # Fallback: app name may contain special chars, try broader match
+        if [[ -z "$APP_ID" ]]; then
+          APP_ID=$(echo "$APP_LIST" \
+            | grep -F "\"${APP_NAME}\"" \
+            | grep -oP 'app_id="\K[0-9]+' \
+            | head -1 || true)
+        fi
+
+        if [[ -z "$APP_ID" ]]; then
+          echo "::error::Application profile '$APP_NAME' not found in Veracode. " \
+               "Verify the name or set create_profile=true."
+          exit 1
+        fi
+        echo "Resolved app_id: $APP_ID"
+        echo "app_id=$APP_ID" >> "$GITHUB_OUTPUT"
+
+        # ---- Resolve sandbox_id (if sandbox scan) --------------------------
+        SANDBOX_ID=""
+        SANDBOX_ARGS=()
+        if [[ -n "$SANDBOX_NAME" ]]; then
+          echo "Resolving sandbox_id for '$SANDBOX_NAME'..."
+          SB_LIST=$(java -jar "$JAR" "${CREDS[@]}" -action GetSandboxList -appid "$APP_ID" 2>&1)
+          SANDBOX_ID=$(echo "$SB_LIST" \
+            | grep -oP "sandbox_name=\"${SANDBOX_NAME}\"[^/]+" \
+            | grep -oP 'sandbox_id="\K[0-9]+' \
+            || true)
+
+          if [[ -n "$SANDBOX_ID" ]]; then
+            echo "Resolved sandbox_id: $SANDBOX_ID"
+            SANDBOX_ARGS=(-sandboxid "$SANDBOX_ID")
+          else
+            echo "::notice::Sandbox '$SANDBOX_NAME' not yet found — will be created on upload."
+          fi
+        fi
+        echo "sandbox_id=$SANDBOX_ID" >> "$GITHUB_OUTPUT"
+
+        # ---- Get current build status --------------------------------------
+        echo "Checking current build status..."
+        BUILD_INFO=$(java -jar "$JAR" "${CREDS[@]}" \
+          -action GetBuildInfo \
+          -appid "$APP_ID" \
+          "${SANDBOX_ARGS[@]}" 2>&1) || true
+
+        # Extract status from XML attribute: status="..."
+        BUILD_STATUS=$(echo "$BUILD_INFO" \
+          | grep -oP 'status="\K[^"]+' \
+          | head -1 || true)
+
+        BUILD_ID=$(echo "$BUILD_INFO" \
+          | grep -oP 'build_id="\K[0-9]+' \
+          | head -1 || true)
+
+        if [[ -z "$BUILD_STATUS" ]]; then
+          BUILD_STATUS="no_build"
+          BUILD_ID="none"
+          echo "No existing build found — clean slate."
+        else
+          echo "Existing build_id=$BUILD_ID  status='$BUILD_STATUS'"
+        fi
+
+        echo "preflight_status=$BUILD_STATUS" >> "$GITHUB_OUTPUT"
+        STALE_DELETED="false"
+
+        # ---- Decision table ------------------------------------------------
+        # States that are definitively "safe to proceed" — no action needed
+        PROCEED_STATES=("Results Ready" "no_build")
+
+        # States where safe mode will delete
+        SAFE_DELETE_STATES=("Incomplete" "No Modules Defined" "Prescan Failed")
+
+        # Additional states force mode adds
+        FORCE_ONLY_STATES=("Prescan Submitted" "Prescan Success" "Scan In Process")
+
+        is_in_list() {
+          local needle="$1"; shift
+          for s in "$@"; do [[ "$s" == "$needle" ]] && return 0; done
+          return 1
+        }
+
+        if is_in_list "$BUILD_STATUS" "${PROCEED_STATES[@]}"; then
+          echo "Status '$BUILD_STATUS' — no cleanup needed."
+
+        elif [[ "$PREFLIGHT_MODE" == "none" ]]; then
+          echo "::error::Build is in blocking state '$BUILD_STATUS' and preflight_mode=none." \
+               "Manually delete the build or change preflight_mode to 'safe' or 'force'."
+          echo "::endgroup::"
+          exit 1
+
+        elif [[ "$PREFLIGHT_MODE" == "safe" ]] && is_in_list "$BUILD_STATUS" "${SAFE_DELETE_STATES[@]}"; then
+          echo "Deleting stale build $BUILD_ID (status='$BUILD_STATUS', mode=safe)..."
+          java -jar "$JAR" "${CREDS[@]}" \
+            -action DeleteBuild \
+            -appid "$APP_ID" \
+            "${SANDBOX_ARGS[@]}" 2>&1
+          STALE_DELETED="true"
+          echo "::notice title=Stale Build Deleted::Deleted build $BUILD_ID (was '$BUILD_STATUS') before re-scan."
+
+        elif [[ "$PREFLIGHT_MODE" == "safe" ]] && is_in_list "$BUILD_STATUS" "${FORCE_ONLY_STATES[@]}"; then
+          echo "::warning::Build is in '$BUILD_STATUS' state. preflight_mode=safe will NOT delete" \
+               "an active/submitted scan. Use preflight_mode=force if intentional," \
+               "or wait for the existing scan to complete."
+
+        elif [[ "$PREFLIGHT_MODE" == "force" ]] && \
+             ( is_in_list "$BUILD_STATUS" "${SAFE_DELETE_STATES[@]}" || \
+               is_in_list "$BUILD_STATUS" "${FORCE_ONLY_STATES[@]}" ); then
+          echo "Force-deleting build $BUILD_ID (status='$BUILD_STATUS', mode=force)..."
+          java -jar "$JAR" "${CREDS[@]}" \
+            -action DeleteBuild \
+            -appid "$APP_ID" \
+            "${SANDBOX_ARGS[@]}" 2>&1
+          STALE_DELETED="true"
+          echo "::notice title=Stale Build Force-Deleted::Force-deleted build $BUILD_ID (was '$BUILD_STATUS')."
+
+        else
+          echo "::warning::Unhandled status '$BUILD_STATUS' with mode '$PREFLIGHT_MODE' — proceeding anyway."
+        fi
+
+        echo "stale_build_deleted=$STALE_DELETED" >> "$GITHUB_OUTPUT"
+        echo "::endgroup::"
+
+    # =========================================================================
+    # STEP 3 — Upload and Scan via JAR
+    # =========================================================================
+    - name: Veracode Upload and Scan
+      id: upload-scan
+      shell: bash
+      continue-on-error: true   # we evaluate the exit code explicitly below
+      env:
+        VERACODE_API_KEY_ID:     ${{ inputs.vid }}
+        VERACODE_API_KEY_SECRET: ${{ inputs.vkey }}
+      run: |
+        set -uo pipefail   # no -e; we capture the exit code manually
+
+        JAR="${{ steps.get-jar.outputs.jar_path }}"
+        APP_ID="${{ steps.preflight.outputs.app_id }}"
+        SANDBOX_ID="${{ steps.preflight.outputs.sandbox_id }}"
+
+        # Build version label
+        SCAN_VERSION="${{ inputs.scan_version }}"
+        if [[ -z "$SCAN_VERSION" ]]; then
+          SCAN_VERSION="GHA-${{ github.run_id }}-${{ github.run_attempt }}"
+        fi
+        echo "Scan version label: $SCAN_VERSION"
+
+        # Start building args array — credentials first (not logged)
+        ARGS=(
+          -vid   "$VERACODE_API_KEY_ID"
+          -vkey  "$VERACODE_API_KEY_SECRET"
+          -action uploadandscan
+          -appname "${{ inputs.app_name }}"
+          -createprofile "${{ inputs.create_profile }}"
+          -filepath "${{ inputs.artifact_path }}"
+          -version "$SCAN_VERSION"
+          -criticality "${{ inputs.criticality }}"
+          -maxretrycount "${{ inputs.max_retry_count }}"
+          # Safety net: let JAR self-heal Incomplete/No Modules Defined/Prescan Failed
+          # in case a race between pre-flight and upload created a new one
+          -deleteincompletescan 1
+        )
+
+        # Optional scan timeout (minutes) — 0 means "don't wait" (fire and forget at JAR level)
+        # We manage our own polling loop in step 4, so pass 0 to the JAR to avoid
+        # duplicate waiting. The JAR still submits the scan.
+        ARGS+=(-scantimeout 0)
+
+        # Sandbox args
+        if [[ -n "$SANDBOX_ID" ]]; then
+          ARGS+=(-sandboxid "$SANDBOX_ID")
+        elif [[ -n "${{ inputs.sandbox_name }}" ]]; then
+          ARGS+=(-sandboxname "${{ inputs.sandbox_name }}")
+          ARGS+=(-createsandbox "${{ inputs.create_sandbox }}")
+        fi
+
+        # Optional module filters
+        [[ -n "${{ inputs.include_modules }}" ]] && ARGS+=(-include "${{ inputs.include_modules }}")
+        [[ -n "${{ inputs.exclude_modules }}" ]] && ARGS+=(-exclude "${{ inputs.exclude_modules }}")
+        [[ "${{ inputs.scan_all_nonfatal_top_level_modules }}" == "true" ]] && \
+          ARGS+=(-scanallnonfataltoplevelmodules true)
+        [[ "${{ inputs.selected_previously }}" == "true" ]] && \
+          ARGS+=(-selectedpreviously true)
+        [[ "${{ inputs.top_level }}" == "true" ]] && \
+          ARGS+=(-toplevel true)
+        [[ "${{ inputs.debug }}" == "true" ]] && \
+          ARGS+=(-debug true)
+
+        echo "::group::Veracode Upload and Scan"
+        # Log args without credentials
+        LOG_ARGS=("${ARGS[@]}")
+        for i in "${!LOG_ARGS[@]}"; do
+          if [[ "${LOG_ARGS[$i]}" == "-vid" || "${LOG_ARGS[$i]}" == "-vkey" ]]; then
+            LOG_ARGS[$((i+1))]="***"
+          fi
+        done
+        echo "JAR args: ${LOG_ARGS[*]}"
+
+        java -jar "$JAR" "${ARGS[@]}"
+        JAR_EXIT=$?
+        echo "::endgroup::"
+
+        echo "jar_exit_code=$JAR_EXIT" >> "$GITHUB_OUTPUT"
+        echo "scan_version=$SCAN_VERSION" >> "$GITHUB_OUTPUT"
+
+        # Non-zero exit: could be upload error OR policy violation (JAR doesn't distinguish)
+        if [[ $JAR_EXIT -ne 0 ]]; then
+          echo "::warning::Veracode JAR exited with code $JAR_EXIT." \
+               "This may indicate an upload error or a policy violation." \
+               "Check the log above for details."
+        fi
+        # Always exit 0 here; step 5 (summarize) makes the final pass/fail decision
+        exit 0
+
+    # =========================================================================
+    # STEP 4 — Wait for Results (polling loop)
+    # =========================================================================
+    - name: Wait for scan results
+      id: wait-results
+      shell: bash
+      env:
+        VERACODE_API_KEY_ID:     ${{ inputs.vid }}
+        VERACODE_API_KEY_SECRET: ${{ inputs.vkey }}
+      run: |
+        set -euo pipefail
+
+        # If upload step already failed hard (jar_exit_code != 0 in a way that
+        # means "upload error, not policy"), skip polling
+        JAR_EXIT="${{ steps.upload-scan.outputs.jar_exit_code }}"
+        WAIT="${{ inputs.wait_for_results }}"
+        APP_ID="${{ steps.preflight.outputs.app_id }}"
+        SANDBOX_ID="${{ steps.preflight.outputs.sandbox_id }}"
+        JAR="${{ steps.get-jar.outputs.jar_path }}"
+        TIMEOUT_MIN="${{ inputs.scan_timeout_minutes }}"
+        POLL_SEC="${{ inputs.poll_interval_seconds }}"
+
+        # Clamp poll interval to Veracode recommended range
+        POLL_SEC=$(( POLL_SEC < 30  ? 30  : POLL_SEC ))
+        POLL_SEC=$(( POLL_SEC > 120 ? 120 : POLL_SEC ))
+
+        echo "build_id=unknown"            >> "$GITHUB_OUTPUT"
+        echo "final_status=unknown"        >> "$GITHUB_OUTPUT"
+        echo "policy_compliance=unknown"   >> "$GITHUB_OUTPUT"
+
+        if [[ "$WAIT" != "true" ]]; then
+          echo "wait_for_results=false — scan submitted asynchronously."
+          echo "final_status=submitted"  >> "$GITHUB_OUTPUT"  # overwrite
+          exit 0
+        fi
+
+        echo "::group::Waiting for Veracode scan results (timeout=${TIMEOUT_MIN}min, poll=${POLL_SEC}s)"
+
+        CREDS=(-vid "$VERACODE_API_KEY_ID" -vkey "$VERACODE_API_KEY_SECRET")
+        SANDBOX_ARGS=()
+        [[ -n "$SANDBOX_ID" ]] && SANDBOX_ARGS=(-sandboxid "$SANDBOX_ID")
+
+        TIMEOUT_SEC=$(( TIMEOUT_MIN * 60 ))
+        ELAPSED=0
+        FINAL_STATUS=""
+        BUILD_ID_FOUND=""
+
+        while true; do
+          BUILD_INFO=$(java -jar "$JAR" "${CREDS[@]}" \
+            -action GetBuildInfo \
+            -appid "$APP_ID" \
+            "${SANDBOX_ARGS[@]}" 2>&1) || true
+
+          CURR_STATUS=$(echo "$BUILD_INFO" \
+            | grep -oP 'status="\K[^"]+' \
+            | head -1 || true)
+
+          BUILD_ID_FOUND=$(echo "$BUILD_INFO" \
+            | grep -oP 'build_id="\K[0-9]+' \
+            | head -1 || true)
+
+          POLICY=$(echo "$BUILD_INFO" \
+            | grep -oP 'policy_compliance_status="\K[^"]+' \
+            | head -1 || true)
+
+          echo "[$(date -u +%H:%M:%S)] status='${CURR_STATUS:-unknown}'  build_id='${BUILD_ID_FOUND:-?}'  elapsed=${ELAPSED}s"
+
+          if [[ "$CURR_STATUS" == "Results Ready" ]]; then
+            FINAL_STATUS="Results Ready"
+            echo "Scan complete — Results Ready."
+            break
+          fi
+
+          # Timeout check (0 = unlimited)
+          if [[ "$TIMEOUT_SEC" -gt 0 && "$ELAPSED" -ge "$TIMEOUT_SEC" ]]; then
+            FINAL_STATUS="timed_out"
+            echo "::warning::Polling timed out after ${TIMEOUT_MIN} minutes." \
+                 "Scan status was '${CURR_STATUS}'. Results may still complete on the platform."
+            break
+          fi
+
+          sleep "$POLL_SEC"
+          ELAPSED=$(( ELAPSED + POLL_SEC ))
+        done
+
+        echo "::endgroup::"
+
+        # Write outputs
+        {
+          echo "build_id=${BUILD_ID_FOUND:-unknown}"
+          echo "final_status=${FINAL_STATUS}"
+          echo "policy_compliance=${POLICY:-unknown}"
+        } >> "$GITHUB_OUTPUT"
+
+    # =========================================================================
+    # STEP 5 — Summarize and set final outcome
+    # =========================================================================
+    - name: Summarize scan outcome
+      id: summarize
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        JAR_EXIT="${{ steps.upload-scan.outputs.jar_exit_code }}"
+        FINAL_STATUS="${{ steps.wait-results.outputs.final_status }}"
+        POLICY="${{ steps.wait-results.outputs.policy_compliance }}"
+        WAIT="${{ inputs.wait_for_results }}"
+        FAIL_ON_POLICY="${{ inputs.fail_on_policy_violation }}"
+        STALE_DELETED="${{ steps.preflight.outputs.stale_build_deleted }}"
+        PREFLIGHT_STATUS="${{ steps.preflight.outputs.preflight_status }}"
+        BUILD_ID="${{ steps.wait-results.outputs.build_id }}"
+        SCAN_VERSION="${{ steps.upload-scan.outputs.scan_version }}"
+
+        # ---- Print summary table ------------------------------------------
+        echo ""
+        echo "┌─────────────────────────────────────────────────────────────┐"
+        echo "│              Veracode Scan Summary                          │"
+        echo "├──────────────────────────────┬──────────────────────────────┤"
+        printf "│ %-28s │ %-28s │\n" "App Name"      "${{ inputs.app_name }}"
+        printf "│ %-28s │ %-28s │\n" "Sandbox"       "${SANDBOX_NAME:-<policy scan>}"
+        printf "│ %-28s │ %-28s │\n" "Scan Version"  "$SCAN_VERSION"
+        printf "│ %-28s │ %-28s │\n" "Build ID"      "$BUILD_ID"
+        printf "│ %-28s │ %-28s │\n" "Pre-flight Status" "$PREFLIGHT_STATUS"
+        printf "│ %-28s │ %-28s │\n" "Stale Build Deleted" "$STALE_DELETED"
+        printf "│ %-28s │ %-28s │\n" "JAR Exit Code" "$JAR_EXIT"
+        printf "│ %-28s │ %-28s │\n" "Final Status"  "$FINAL_STATUS"
+        printf "│ %-28s │ %-28s │\n" "Policy Compliance" "$POLICY"
+        echo "└──────────────────────────────┴──────────────────────────────┘"
+        echo ""
+
+        # ---- Derive scan_outcome ------------------------------------------
+        OUTCOME="unknown"
+        EXIT_CODE=0
+
+        if [[ "$JAR_EXIT" != "0" && "$FINAL_STATUS" != "Results Ready" ]]; then
+          # JAR failed and we didn't reach results — treat as upload failure
+          OUTCOME="upload_failed"
+          EXIT_CODE=1
+          echo "::error title=Veracode Upload Failed::JAR exited $JAR_EXIT before results were ready."
+
+        elif [[ "$WAIT" != "true" ]]; then
+          OUTCOME="submitted"
+          echo "::notice title=Veracode Scan Submitted::Scan submitted asynchronously. Results will be available on the Veracode platform."
+
+        elif [[ "$FINAL_STATUS" == "timed_out" ]]; then
+          OUTCOME="timed_out"
+          EXIT_CODE=1
+          echo "::error title=Veracode Timeout::Scan did not reach Results Ready within ${{ inputs.scan_timeout_minutes }} minutes."
+
+        elif [[ "$FINAL_STATUS" == "Results Ready" ]]; then
+          case "$POLICY" in
+            "Pass")
+              OUTCOME="policy_pass"
+              echo "::notice title=Veracode Policy Pass::Scan completed and PASSED policy. Build ID: $BUILD_ID"
+              ;;
+            "Did Not Pass")
+              OUTCOME="policy_fail"
+              if [[ "$FAIL_ON_POLICY" == "true" ]]; then
+                EXIT_CODE=1
+                echo "::error title=Veracode Policy Fail::Scan completed but DID NOT PASS policy. Build ID: $BUILD_ID"
+              else
+                echo "::warning title=Veracode Policy Fail::Scan DID NOT PASS policy (fail_on_policy_violation=false)."
+              fi
+              ;;
+            "Not Assessed")
+              OUTCOME="results_ready"
+              echo "::notice title=Veracode Results Ready::Scan complete — policy not yet assessed. Build ID: $BUILD_ID"
+              ;;
+            *)
+              OUTCOME="results_ready"
+              echo "::notice title=Veracode Results Ready::Scan complete. Policy compliance: '$POLICY'. Build ID: $BUILD_ID"
+              ;;
+          esac
+        fi
+
+        echo "scan_outcome=$OUTCOME" >> "$GITHUB_OUTPUT"
+
+        # Write GitHub Step Summary
+        {
+          echo "## Veracode Scan Results"
+          echo "| Field | Value |"
+          echo "|---|---|"
+          echo "| App Name | \`${{ inputs.app_name }}\` |"
+          echo "| Sandbox | \`${SANDBOX_NAME:-policy scan}\` |"
+          echo "| Scan Version | \`$SCAN_VERSION\` |"
+          echo "| Build ID | \`$BUILD_ID\` |"
+          echo "| Pre-flight Status | \`$PREFLIGHT_STATUS\` |"
+          echo "| Stale Build Deleted | \`$STALE_DELETED\` |"
+          echo "| Final Scan Status | \`$FINAL_STATUS\` |"
+          echo "| Policy Compliance | \`$POLICY\` |"
+          echo "| Outcome | **\`$OUTCOME\`** |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        exit $EXIT_CODE
+      env:
+        SANDBOX_NAME: ${{ inputs.sandbox_name }}
