@@ -48,7 +48,9 @@ jobs:
           retention-days: 1
 
   # ---------------------------------------------------------------------------
-  # Veracode policy scan — main branch only, waits for results, breaks build
+  # Veracode policy scan — main branch
+  # Waits for results. Fails the workflow if policy is not passed.
+  # This is the default, strictest mode.
   # ---------------------------------------------------------------------------
   veracode-policy:
     name: Veracode Policy Scan
@@ -56,22 +58,27 @@ jobs:
     needs: build
     uses: your-org/.github/.github/workflows/veracode-sast-scan.yml@main
     with:
-      app_name:               'MyApp-Production'
-      artifact_path:          '${{ github.workspace }}/drop/myapp.zip'
-      sandbox_name:           ''                    # empty = policy scan
-      wait_for_results:       true
-      scan_timeout_minutes:   90
+      app_name:                 'MyApp-Production'
+      artifact_path:            '${{ github.workspace }}/drop/myapp.zip'
+      sandbox_name:             ''
+      wait_for_results:         true
+      scan_timeout_minutes:     90
       fail_on_policy_violation: true
-      preflight_mode:         'safe'                # delete Incomplete/Failed only
-      runner_label:           'ubuntu-latest'
+      fail_workflow_on_error:   true     # default: policy fail = workflow red + stops here
+      preflight_mode:           'safe'
+      runner_label:             'ubuntu-latest'
     secrets:
-      VERACODE_API_ID:        ${{ secrets.VERACODE_API_ID }}
-      VERACODE_API_KEY:       ${{ secrets.VERACODE_API_KEY }}
-      NEXUS_USERNAME:         ${{ secrets.NEXUS_USER }}
-      NEXUS_PASSWORD:         ${{ secrets.NEXUS_PASS }}
+      VERACODE_API_ID:          ${{ secrets.VERACODE_API_ID }}
+      VERACODE_API_KEY:         ${{ secrets.VERACODE_API_KEY }}
+      NEXUS_USERNAME:           ${{ secrets.NEXUS_USER }}
+      NEXUS_PASSWORD:           ${{ secrets.NEXUS_PASS }}
 
   # ---------------------------------------------------------------------------
-  # Veracode sandbox scan — feature branches, waits but does NOT break build
+  # Veracode sandbox scan — feature branches
+  # Waits for results. Shows a red annotation on the scan step if policy fails,
+  # but the workflow continues so the PR is not blocked.
+  # A separate gate job below reads scan_failed and can optionally post a
+  # PR comment or set a commit status without hard-failing the branch.
   # ---------------------------------------------------------------------------
   veracode-sandbox:
     name: Veracode Sandbox Scan
@@ -79,37 +86,76 @@ jobs:
     needs: build
     uses: your-org/.github/.github/workflows/veracode-sast-scan.yml@main
     with:
-      app_name:               'MyApp-Production'
-      artifact_path:          '${{ github.workspace }}/drop/myapp.zip'
-      sandbox_name:           'feature-branch-ci'   # shared sandbox for all feature branches
-      create_sandbox:         true
-      wait_for_results:       true
-      scan_timeout_minutes:   60
-      fail_on_policy_violation: false               # report but don't break feature branches
-      preflight_mode:         'force'               # feature branches: clear whatever is in the sandbox
-      runner_label:           'ubuntu-latest'
+      app_name:                 'MyApp-Production'
+      artifact_path:            '${{ github.workspace }}/drop/myapp.zip'
+      sandbox_name:             'feature-branch-ci'
+      create_sandbox:           true
+      wait_for_results:         true
+      scan_timeout_minutes:     60
+      fail_on_policy_violation: true     # still mark as an error condition…
+      fail_workflow_on_error:   false    # …but don't kill the workflow
+      preflight_mode:           'force'
+      runner_label:             'ubuntu-latest'
     secrets:
-      VERACODE_API_ID:        ${{ secrets.VERACODE_API_ID }}
-      VERACODE_API_KEY:       ${{ secrets.VERACODE_API_KEY }}
+      VERACODE_API_ID:          ${{ secrets.VERACODE_API_ID }}
+      VERACODE_API_KEY:         ${{ secrets.VERACODE_API_KEY }}
 
   # ---------------------------------------------------------------------------
-  # (Alternative) Fire-and-forget sandbox scan — fastest, no wait
+  # Downstream gate — runs after the sandbox scan regardless of its outcome
+  # because veracode-sandbox uses fail_workflow_on_error=false.
+  # This job reads scan_failed and decides what to do — post a comment,
+  # set a commit status, notify a channel, etc. — without hard-blocking CI.
   # ---------------------------------------------------------------------------
-  # veracode-sandbox-async:
-  #   name: Veracode Sandbox Scan (async)
-  #   if: startsWith(github.ref, 'refs/heads/feature/')
+  veracode-gate:
+    name: Veracode Result Gate
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    needs: veracode-sandbox
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate Veracode results
+        shell: bash
+        run: |
+          OUTCOME="${{ needs.veracode-sandbox.outputs.scan_outcome }}"
+          FAILED="${{ needs.veracode-sandbox.outputs.scan_failed }}"
+          POLICY="${{ needs.veracode-sandbox.outputs.policy_compliance }}"
+          BUILD_ID="${{ needs.veracode-sandbox.outputs.build_id }}"
+
+          echo "Scan outcome    : $OUTCOME"
+          echo "Scan failed     : $FAILED"
+          echo "Policy result   : $POLICY"
+          echo "Build ID        : $BUILD_ID"
+
+          if [[ "$FAILED" == "true" ]]; then
+            echo "::warning title=Veracode Gate::Scan outcome was '$OUTCOME' (policy: '$POLICY')."
+            echo "Review findings before merging to main:"
+            echo "  https://analysiscenter.veracode.com"
+            # Add your notification here:
+            # - Post a PR comment via gh cli
+            # - Update a commit status via GitHub REST API
+            # - Send a Teams/Slack webhook
+            # - Write to a compliance log
+            # Do NOT exit 1 here unless you want to block the branch.
+          else
+            echo "Veracode scan passed — no gate action required."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # (Alternative) Fire-and-forget — fastest pipeline, no waiting at all
+  # ---------------------------------------------------------------------------
+  # veracode-async:
+  #   name: Veracode Scan (async)
   #   needs: build
   #   uses: your-org/.github/.github/workflows/veracode-sast-scan.yml@main
   #   with:
-  #     app_name:             'MyApp-Production'
-  #     artifact_path:        '${{ github.workspace }}/drop/myapp.zip'
-  #     sandbox_name:         'feature-branch-ci'
-  #     create_sandbox:       true
-  #     wait_for_results:     false                 # fire and forget
-  #     preflight_mode:       'force'
+  #     app_name:               'MyApp-Production'
+  #     artifact_path:          '${{ github.workspace }}/drop/myapp.zip'
+  #     sandbox_name:           'feature-branch-ci'
+  #     wait_for_results:       false    # submit only; no polling; no outcome available
+  #     fail_workflow_on_error: false    # upload errors also non-fatal
+  #     preflight_mode:         'force'
   #   secrets:
-  #     VERACODE_API_ID:      ${{ secrets.VERACODE_API_ID }}
-  #     VERACODE_API_KEY:     ${{ secrets.VERACODE_API_KEY }}
+  #     VERACODE_API_ID:        ${{ secrets.VERACODE_API_ID }}
+  #     VERACODE_API_KEY:       ${{ secrets.VERACODE_API_KEY }}
 
   # ---------------------------------------------------------------------------
   # Gate downstream deploy on Veracode policy pass (main branch only)
@@ -120,20 +166,22 @@ jobs:
     needs: [build, veracode-policy]
     runs-on: [self-hosted, linux, deploy]
     steps:
-      - name: Check Veracode outcome before deploy
+      - name: Verify Veracode gate before deploy
         shell: bash
         run: |
+          # On main, veracode-policy uses fail_workflow_on_error=true so this job
+          # would never even run if the scan failed. This is a belt-and-suspenders
+          # check using the outputs in case someone changes the flags later.
           OUTCOME="${{ needs.veracode-policy.outputs.scan_outcome }}"
-          POLICY="${{ needs.veracode-policy.outputs.policy_compliance }}"
-          echo "Veracode outcome   : $OUTCOME"
-          echo "Policy compliance  : $POLICY"
-          if [[ "$OUTCOME" != "policy_pass" ]]; then
-            echo "::error::Deploy blocked — Veracode outcome was '$OUTCOME' (policy: '$POLICY')."
+          FAILED="${{ needs.veracode-policy.outputs.scan_failed }}"
+          if [[ "$FAILED" == "true" ]]; then
+            echo "::error::Deploy blocked — Veracode scan_failed=true (outcome: $OUTCOME)"
             exit 1
           fi
+          echo "Veracode gate passed (outcome: $OUTCOME) — proceeding with deploy."
 
       - name: Trigger AAP deployment
         shell: bash
         run: |
-          echo "All gates passed — triggering Ansible Automation Platform deployment..."
+          echo "Triggering Ansible Automation Platform deployment..."
           # curl -X POST https://aap.corp.example.com/api/v2/job_templates/.../launch/ ...

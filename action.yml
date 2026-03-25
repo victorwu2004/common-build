@@ -156,8 +156,28 @@ inputs:
     default: '3'
   fail_on_policy_violation:
     description: >
-      When wait_for_results=true: fail the action if the scan does not pass policy.
-      When wait_for_results=false: this has no effect (result is unknown at job time).
+      When wait_for_results=true: treat a policy violation as a failure condition.
+      Controls whether policy_fail is considered an error — but whether that error
+      actually fails the workflow is controlled separately by fail_workflow_on_error.
+    required: false
+    default: 'true'
+  fail_workflow_on_error:
+    description: |
+      Controls whether ANY scan error (policy fail, upload error, timeout) causes
+      the action to exit non-zero and fail the calling workflow/job.
+
+        true  (default) - exit non-zero on error; workflow step turns red and stops
+        false           - always exit 0; the step and workflow stay green regardless
+                          of scan outcome. Errors are still shown as ::error::
+                          annotations (step shows a red "!" icon in the UI) and the
+                          scan_outcome / policy_compliance outputs are still set so
+                          callers can implement their own downstream gate logic.
+
+      Typical use cases for false:
+        - Informational sandbox scans that should never block a merge
+        - Pipelines where Veracode is one signal among many and a separate
+          gate job owns the final pass/fail decision
+        - Testing the action integration without breaking CI
     required: false
     default: 'true'
 
@@ -189,14 +209,20 @@ outputs:
   scan_outcome:
     description: >
       Human-readable composite outcome:
-        submitted        - scan submitted, wait_for_results=false
-        results_ready    - scan completed, results available
-        policy_pass      - scan completed and passed policy
-        policy_fail      - scan completed but failed policy
-        timed_out        - polling exceeded scan_timeout_minutes
+        submitted         - scan submitted, wait_for_results=false
+        results_ready     - scan completed, results available
+        policy_pass       - scan completed and passed policy
+        policy_fail       - scan completed but failed policy
+        timed_out         - polling exceeded scan_timeout_minutes
         preflight_blocked - stale build found and preflight_mode=none
-        upload_failed    - JAR upload/scan step returned non-zero
+        upload_failed     - JAR upload/scan step returned non-zero
     value: ${{ steps.summarize.outputs.scan_outcome }}
+  scan_failed:
+    description: >
+      'true' if any error condition was detected (policy_fail, upload_failed,
+      timed_out). Set regardless of fail_workflow_on_error so callers can gate
+      on this output even when the action itself did not exit non-zero.
+    value: ${{ steps.summarize.outputs.scan_failed }}
 
 # ---------------------------------------------------------------------------
 # STEPS
@@ -605,10 +631,28 @@ runs:
 
     # =========================================================================
     # STEP 5 — Summarize and set final outcome
+    #
+    # Failure signal matrix:
+    #
+    #   fail_on_policy_violation  fail_workflow_on_error  behaviour
+    #   ────────────────────────  ──────────────────────  ─────────────────────────────────────────
+    #   true                      true  (default)         policy fail → ::error:: + exit 1
+    #   true                      false                   policy fail → ::error:: + exit 0
+    #                                                      (step shows red "!" but job stays green)
+    #   false                     true                    policy fail → ::warning:: + exit 0
+    #   false                     false                   policy fail → ::warning:: + exit 0
+    #
+    #   upload_failed / timed_out always emit ::error::; exit code controlled by
+    #   fail_workflow_on_error only (fail_on_policy_violation does not apply to these).
+    #
+    #   scan_failed output is ALWAYS set to true/false regardless of either flag,
+    #   so downstream jobs can gate on it unconditionally.
     # =========================================================================
     - name: Summarize scan outcome
       id: summarize
       shell: bash
+      # IMPORTANT: never set continue-on-error here — the exit code IS the
+      # workflow gate and must propagate correctly to the calling job.
       run: |
         set -euo pipefail
 
@@ -617,6 +661,7 @@ runs:
         POLICY="${{ steps.wait-results.outputs.policy_compliance }}"
         WAIT="${{ inputs.wait_for_results }}"
         FAIL_ON_POLICY="${{ inputs.fail_on_policy_violation }}"
+        FAIL_WORKFLOW="${{ inputs.fail_workflow_on_error }}"
         STALE_DELETED="${{ steps.preflight.outputs.stale_build_deleted }}"
         PREFLIGHT_STATUS="${{ steps.preflight.outputs.preflight_status }}"
         BUILD_ID="${{ steps.wait-results.outputs.build_id }}"
@@ -627,68 +672,118 @@ runs:
         echo "┌─────────────────────────────────────────────────────────────┐"
         echo "│              Veracode Scan Summary                          │"
         echo "├──────────────────────────────┬──────────────────────────────┤"
-        printf "│ %-28s │ %-28s │\n" "App Name"      "${{ inputs.app_name }}"
-        printf "│ %-28s │ %-28s │\n" "Sandbox"       "${SANDBOX_NAME:-<policy scan>}"
-        printf "│ %-28s │ %-28s │\n" "Scan Version"  "$SCAN_VERSION"
-        printf "│ %-28s │ %-28s │\n" "Build ID"      "$BUILD_ID"
-        printf "│ %-28s │ %-28s │\n" "Pre-flight Status" "$PREFLIGHT_STATUS"
+        printf "│ %-28s │ %-28s │\n" "App Name"           "${{ inputs.app_name }}"
+        printf "│ %-28s │ %-28s │\n" "Sandbox"            "${SANDBOX_NAME:-<policy scan>}"
+        printf "│ %-28s │ %-28s │\n" "Scan Version"       "$SCAN_VERSION"
+        printf "│ %-28s │ %-28s │\n" "Build ID"           "$BUILD_ID"
+        printf "│ %-28s │ %-28s │\n" "Pre-flight Status"  "$PREFLIGHT_STATUS"
         printf "│ %-28s │ %-28s │\n" "Stale Build Deleted" "$STALE_DELETED"
-        printf "│ %-28s │ %-28s │\n" "JAR Exit Code" "$JAR_EXIT"
-        printf "│ %-28s │ %-28s │\n" "Final Status"  "$FINAL_STATUS"
-        printf "│ %-28s │ %-28s │\n" "Policy Compliance" "$POLICY"
+        printf "│ %-28s │ %-28s │\n" "JAR Exit Code"      "$JAR_EXIT"
+        printf "│ %-28s │ %-28s │\n" "Final Status"       "$FINAL_STATUS"
+        printf "│ %-28s │ %-28s │\n" "Policy Compliance"  "$POLICY"
+        printf "│ %-28s │ %-28s │\n" "Fail On Policy"     "$FAIL_ON_POLICY"
+        printf "│ %-28s │ %-28s │\n" "Fail Workflow"      "$FAIL_WORKFLOW"
         echo "└──────────────────────────────┴──────────────────────────────┘"
         echo ""
 
-        # ---- Derive scan_outcome ------------------------------------------
+        # ---- Derive scan_outcome and error severity -----------------------
+        # ERROR_CONDITION tracks whether something went wrong (drives scan_failed output).
+        # SHOULD_FAIL_WORKFLOW tracks whether we will exit non-zero (drives job gate).
         OUTCOME="unknown"
-        EXIT_CODE=0
+        ERROR_CONDITION="false"     # feeds scan_failed output — always honest
+        SHOULD_FAIL_WORKFLOW="false"  # only true when fail_workflow_on_error=true AND error exists
 
+        # Helper: emit either ::error:: or ::warning:: depending on fail_workflow_on_error.
+        # Always emits ::error:: for visibility (red "!" on step) even when not failing
+        # the workflow — this is the key visual signal that something is wrong.
+        annotate_error() {
+          local title="$1"
+          local msg="$2"
+          # ::error:: marks the step with a red annotation icon regardless of exit code.
+          # This is what makes the step visually "failed" in the GitHub UI even when
+          # the workflow itself continues.
+          echo "::error title=${title}::${msg}"
+        }
+
+        # ---- Case: JAR exited non-zero before results were available ------
         if [[ "$JAR_EXIT" != "0" && "$FINAL_STATUS" != "Results Ready" ]]; then
-          # JAR failed and we didn't reach results — treat as upload failure
           OUTCOME="upload_failed"
-          EXIT_CODE=1
-          echo "::error title=Veracode Upload Failed::JAR exited $JAR_EXIT before results were ready."
+          ERROR_CONDITION="true"
+          annotate_error "Veracode Upload Failed" \
+            "JAR exited $JAR_EXIT. The scan may not have been submitted. Check the log above."
+          [[ "$FAIL_WORKFLOW" == "true" ]] && SHOULD_FAIL_WORKFLOW="true"
 
+        # ---- Case: fire-and-forget (no waiting) ---------------------------
         elif [[ "$WAIT" != "true" ]]; then
           OUTCOME="submitted"
-          echo "::notice title=Veracode Scan Submitted::Scan submitted asynchronously. Results will be available on the Veracode platform."
+          echo "::notice title=Veracode Scan Submitted::Scan submitted asynchronously." \
+               "Results will appear on the Veracode platform. Build ID: ${BUILD_ID:-pending}"
 
+        # ---- Case: polling timed out --------------------------------------
         elif [[ "$FINAL_STATUS" == "timed_out" ]]; then
           OUTCOME="timed_out"
-          EXIT_CODE=1
-          echo "::error title=Veracode Timeout::Scan did not reach Results Ready within ${{ inputs.scan_timeout_minutes }} minutes."
+          ERROR_CONDITION="true"
+          annotate_error "Veracode Timeout" \
+            "Scan did not reach 'Results Ready' within ${{ inputs.scan_timeout_minutes }} minutes." \
+            " The scan may still complete on the platform. Build ID: $BUILD_ID"
+          [[ "$FAIL_WORKFLOW" == "true" ]] && SHOULD_FAIL_WORKFLOW="true"
 
+        # ---- Case: results are ready — evaluate policy --------------------
         elif [[ "$FINAL_STATUS" == "Results Ready" ]]; then
           case "$POLICY" in
+
             "Pass")
               OUTCOME="policy_pass"
-              echo "::notice title=Veracode Policy Pass::Scan completed and PASSED policy. Build ID: $BUILD_ID"
+              echo "::notice title=Veracode Policy PASSED::Scan completed and passed policy." \
+                   " Build ID: $BUILD_ID"
               ;;
+
             "Did Not Pass")
               OUTCOME="policy_fail"
               if [[ "$FAIL_ON_POLICY" == "true" ]]; then
-                EXIT_CODE=1
-                echo "::error title=Veracode Policy Fail::Scan completed but DID NOT PASS policy. Build ID: $BUILD_ID"
+                ERROR_CONDITION="true"
+                # Always emit ::error:: so the step is visually marked as failed.
+                # Whether we exit non-zero is a separate decision below.
+                annotate_error "Veracode Policy FAILED" \
+                  "Scan completed but DID NOT PASS policy. Build ID: $BUILD_ID"
+                [[ "$FAIL_WORKFLOW" == "true" ]] && SHOULD_FAIL_WORKFLOW="true"
               else
-                echo "::warning title=Veracode Policy Fail::Scan DID NOT PASS policy (fail_on_policy_violation=false)."
+                # Policy violations are known/accepted — downgrade to warning
+                echo "::warning title=Veracode Policy Did Not Pass::Scan completed but did not" \
+                     " pass policy (fail_on_policy_violation=false). Build ID: $BUILD_ID"
               fi
               ;;
+
             "Not Assessed")
               OUTCOME="results_ready"
-              echo "::notice title=Veracode Results Ready::Scan complete — policy not yet assessed. Build ID: $BUILD_ID"
+              echo "::notice title=Veracode Results Ready::Scan complete — policy not yet" \
+                   " assessed (sandbox scans are typically not assessed). Build ID: $BUILD_ID"
               ;;
+
             *)
               OUTCOME="results_ready"
-              echo "::notice title=Veracode Results Ready::Scan complete. Policy compliance: '$POLICY'. Build ID: $BUILD_ID"
+              echo "::notice title=Veracode Results Ready::Scan complete." \
+                   " Policy compliance: '${POLICY:-unknown}'. Build ID: $BUILD_ID"
               ;;
           esac
         fi
 
-        echo "scan_outcome=$OUTCOME" >> "$GITHUB_OUTPUT"
+        # ---- Write outputs ------------------------------------------------
+        {
+          echo "scan_outcome=$OUTCOME"
+          echo "scan_failed=$ERROR_CONDITION"
+        } >> "$GITHUB_OUTPUT"
 
-        # Write GitHub Step Summary
+        # ---- Write GitHub Step Summary ------------------------------------
+        # Emoji legend for the summary table
+        STATUS_ICON="✅"
+        [[ "$ERROR_CONDITION" == "true" ]] && STATUS_ICON="❌"
+        [[ "$OUTCOME" == "submitted" ]]    && STATUS_ICON="📤"
+        [[ "$OUTCOME" == "timed_out" ]]    && STATUS_ICON="⏱️"
+
         {
           echo "## Veracode Scan Results"
+          echo ""
           echo "| Field | Value |"
           echo "|---|---|"
           echo "| App Name | \`${{ inputs.app_name }}\` |"
@@ -699,9 +794,28 @@ runs:
           echo "| Stale Build Deleted | \`$STALE_DELETED\` |"
           echo "| Final Scan Status | \`$FINAL_STATUS\` |"
           echo "| Policy Compliance | \`$POLICY\` |"
-          echo "| Outcome | **\`$OUTCOME\`** |"
+          echo "| Outcome | ${STATUS_ICON} **\`$OUTCOME\`** |"
+          echo "| Scan Failed | \`$ERROR_CONDITION\` |"
+          echo "| Workflow Failed | \`$SHOULD_FAIL_WORKFLOW\` |"
+          echo ""
+          if [[ "$ERROR_CONDITION" == "true" && "$SHOULD_FAIL_WORKFLOW" == "false" ]]; then
+            echo "> ⚠️ **Note:** Scan errors were detected but \`fail_workflow_on_error=false\`."
+            echo "> The workflow will continue. Check \`scan_failed\` / \`scan_outcome\` outputs"
+            echo "> in downstream steps to gate on these results."
+          fi
         } >> "$GITHUB_STEP_SUMMARY"
 
-        exit $EXIT_CODE
+        # ---- Final exit --------------------------------------------------
+        # This is the ONLY place we exit non-zero. Everything above just sets flags.
+        if [[ "$SHOULD_FAIL_WORKFLOW" == "true" ]]; then
+          echo ""
+          echo "Exiting non-zero: fail_workflow_on_error=true and error condition detected."
+          echo "Set fail_workflow_on_error=false to allow the workflow to continue"
+          echo "and inspect scan_failed / scan_outcome outputs for custom gate logic."
+          exit 1
+        fi
+
+        echo "Exiting 0: workflow continues (scan_failed=$ERROR_CONDITION, outcome=$OUTCOME)."
+        exit 0
       env:
         SANDBOX_NAME: ${{ inputs.sandbox_name }}

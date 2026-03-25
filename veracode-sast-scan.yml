@@ -58,7 +58,14 @@ on:
         required: false
         default: 60
       fail_on_policy_violation:
-        description: 'Fail the workflow if policy is not passed'
+        description: 'Treat a policy violation as a failure condition'
+        type: boolean
+        required: false
+        default: true
+      fail_workflow_on_error:
+        description: >
+          false = action emits ::error:: annotations but exits 0 so the workflow
+          continues. Use scan_failed / scan_outcome outputs for downstream gating.
         type: boolean
         required: false
         default: true
@@ -116,6 +123,9 @@ on:
       scan_outcome:
         description: 'submitted | policy_pass | policy_fail | timed_out | upload_failed'
         value: ${{ jobs.veracode-scan.outputs.scan_outcome }}
+      scan_failed:
+        description: 'true if any error was detected, regardless of fail_workflow_on_error'
+        value: ${{ jobs.veracode-scan.outputs.scan_failed }}
       policy_compliance:
         description: 'Pass | Did Not Pass | Not Assessed | unknown'
         value: ${{ jobs.veracode-scan.outputs.policy_compliance }}
@@ -133,6 +143,7 @@ jobs:
 
     outputs:
       scan_outcome:       ${{ steps.scan.outputs.scan_outcome }}
+      scan_failed:        ${{ steps.scan.outputs.scan_failed }}
       policy_compliance:  ${{ steps.scan.outputs.policy_compliance }}
       build_id:           ${{ steps.scan.outputs.build_id }}
       final_status:       ${{ steps.scan.outputs.final_status }}
@@ -158,6 +169,7 @@ jobs:
           wait_for_results:                  ${{ inputs.wait_for_results }}
           scan_timeout_minutes:              ${{ inputs.scan_timeout_minutes }}
           fail_on_policy_violation:          ${{ inputs.fail_on_policy_violation }}
+          fail_workflow_on_error:            ${{ inputs.fail_workflow_on_error }}
           preflight_mode:                    ${{ inputs.preflight_mode }}
           include_modules:                   ${{ inputs.include_modules }}
           exclude_modules:                   ${{ inputs.exclude_modules }}
