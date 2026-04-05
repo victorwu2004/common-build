@@ -1,0 +1,389 @@
+name: Publish to Nexus Repository
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: 'Name of the artifact to publish'
+        required: true
+        type: string
+      repository-format:
+        description: 'Repository format (maven, npm, pypi, nuget, raw)'
+        required: true
+        type: string
+      repository-name:
+        description: 'Target repository name in Nexus'
+        required: true
+        type: string
+      group-id:
+        description: 'Group ID (Maven) / Scope (npm) / Package name prefix'
+        required: false
+        type: string
+        default: ''
+      artifact-id:
+        description: 'Artifact ID / Package name'
+        required: true
+        type: string
+      version:
+        description: 'Version to publish'
+        required: true
+        type: string
+      classifier:
+        description: 'Maven classifier (optional)'
+        required: false
+        type: string
+        default: ''
+      extension:
+        description: 'File extension (jar, war, zip, tgz, nupkg, whl)'
+        required: false
+        type: string
+        default: ''
+      generate-pom:
+        description: 'Generate POM for Maven artifacts'
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      published-url:
+        description: 'URL of the published artifact'
+        value: ${{ jobs.publish.outputs.published-url }}
+      publish-status:
+        description: 'Publication status'
+        value: ${{ jobs.publish.outputs.status }}
+    secrets:
+      NEXUS_URL:
+        required: true
+      NEXUS_USERNAME:
+        required: true
+      NEXUS_PASSWORD:
+        required: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    outputs:
+      published-url: ${{ steps.set-output.outputs.url }}
+      status: ${{ steps.set-output.outputs.status }}
+    
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ./artifact
+
+      - name: Prepare artifact
+        id: prepare
+        run: |
+          cd ./artifact
+          
+          if ls *.zip 1> /dev/null 2>&1; then
+            echo "Extracting zip archive..."
+            for f in *.zip; do
+              unzip -o "$f"
+            done
+          fi
+          
+          echo "Artifact contents:"
+          ls -la
+
+      - name: Setup Node.js (for npm)
+        if: inputs.repository-format == 'npm'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python (for PyPI)
+        if: inputs.repository-format == 'pypi'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup .NET (for NuGet)
+        if: inputs.repository-format == 'nuget'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish to Maven Repository
+        id: publish-maven
+        if: inputs.repository-format == 'maven'
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          GROUP_ID="${{ inputs.group-id }}"
+          ARTIFACT_ID="${{ inputs.artifact-id }}"
+          VERSION="${{ inputs.version }}"
+          CLASSIFIER="${{ inputs.classifier }}"
+          REPO="${{ inputs.repository-name }}"
+          
+          GROUP_PATH=$(echo "$GROUP_ID" | tr '.' '/')
+          
+          cd ./artifact
+          
+          # Find artifact file
+          if [[ -n "${{ inputs.extension }}" ]]; then
+            EXTENSION="${{ inputs.extension }}"
+          else
+            EXTENSION="jar"
+          fi
+          
+          ARTIFACT_FILE=$(find . -name "*.$EXTENSION" -not -name "*-sources.*" -not -name "*-javadoc.*" | head -1)
+          
+          if [[ -z "$ARTIFACT_FILE" ]]; then
+            echo "::error::No artifact file found with extension .$EXTENSION"
+            exit 1
+          fi
+          
+          BASE_PATH="${NEXUS_URL}/repository/${REPO}/${GROUP_PATH}/${ARTIFACT_ID}/${VERSION}"
+          
+          FILENAME="${ARTIFACT_ID}-${VERSION}"
+          if [[ -n "$CLASSIFIER" ]]; then
+            FILENAME="${FILENAME}-${CLASSIFIER}"
+          fi
+          FILENAME="${FILENAME}.${EXTENSION}"
+          
+          UPLOAD_URL="${BASE_PATH}/${FILENAME}"
+          
+          echo "Publishing to: $UPLOAD_URL"
+          
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+            --upload-file "$ARTIFACT_FILE" \
+            "$UPLOAD_URL")
+          
+          if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]]; then
+            echo "url=$UPLOAD_URL" >> $GITHUB_OUTPUT
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "✅ Successfully published to: $UPLOAD_URL"
+            
+            # Generate POM if requested
+            if [[ "${{ inputs.generate-pom }}" == "true" ]]; then
+              POM_FILE="./pom.xml"
+              cat > "$POM_FILE" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+              <groupId>${GROUP_ID}</groupId>
+              <artifactId>${ARTIFACT_ID}</artifactId>
+              <version>${VERSION}</version>
+              <packaging>${EXTENSION}</packaging>
+          </project>
+          EOF
+              
+              POM_URL="${BASE_PATH}/${ARTIFACT_ID}-${VERSION}.pom"
+              curl -s -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+                --upload-file "$POM_FILE" \
+                "$POM_URL"
+              echo "POM uploaded to: $POM_URL"
+            fi
+          else
+            echo "::error::Failed to publish artifact. HTTP status: $HTTP_STATUS"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Publish to npm Repository
+        id: publish-npm
+        if: inputs.repository-format == 'npm'
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          REPO="${{ inputs.repository-name }}"
+          SCOPE="${{ inputs.group-id }}"
+          PKG_NAME="${{ inputs.artifact-id }}"
+          VERSION="${{ inputs.version }}"
+          
+          REGISTRY_URL="${NEXUS_URL}/repository/${REPO}/"
+          REGISTRY_HOST=$(echo "$NEXUS_URL" | sed 's|https://||' | sed 's|http://||')
+          
+          npm config set registry "$REGISTRY_URL"
+          
+          AUTH_TOKEN=$(echo -n "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" | base64)
+          npm config set "//${REGISTRY_HOST}/repository/${REPO}/:_auth" "$AUTH_TOKEN"
+          
+          cd ./artifact
+          
+          if [[ -f "package.json" ]]; then
+            npm version "$VERSION" --no-git-tag-version --allow-same-version 2>/dev/null || true
+            npm publish --registry "$REGISTRY_URL"
+          elif ls *.tgz 1> /dev/null 2>&1; then
+            npm publish *.tgz --registry "$REGISTRY_URL"
+          fi
+          
+          if [[ -n "$SCOPE" ]]; then
+            PUBLISHED_URL="${REGISTRY_URL}${SCOPE}/${PKG_NAME}/-/${PKG_NAME}-${VERSION}.tgz"
+          else
+            PUBLISHED_URL="${REGISTRY_URL}${PKG_NAME}/-/${PKG_NAME}-${VERSION}.tgz"
+          fi
+          
+          echo "url=$PUBLISHED_URL" >> $GITHUB_OUTPUT
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "✅ Successfully published to: $PUBLISHED_URL"
+
+      - name: Publish to PyPI Repository
+        id: publish-pypi
+        if: inputs.repository-format == 'pypi'
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          pip install twine
+          
+          REPO="${{ inputs.repository-name }}"
+          PKG_NAME="${{ inputs.artifact-id }}"
+          VERSION="${{ inputs.version }}"
+          
+          REPO_URL="${NEXUS_URL}/repository/${REPO}/"
+          
+          cd ./artifact
+          
+          DIST_FILES=$(find . -name "*.whl" -o -name "*.tar.gz" | tr '\n' ' ')
+          
+          if [[ -z "$DIST_FILES" ]]; then
+            echo "::error::No distribution files found (.whl or .tar.gz)"
+            exit 1
+          fi
+          
+          twine upload \
+            --repository-url "$REPO_URL" \
+            --username "${NEXUS_USERNAME}" \
+            --password "${NEXUS_PASSWORD}" \
+            $DIST_FILES
+          
+          PUBLISHED_URL="${REPO_URL}simple/${PKG_NAME}/"
+          
+          echo "url=$PUBLISHED_URL" >> $GITHUB_OUTPUT
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "✅ Successfully published to: $PUBLISHED_URL"
+
+      - name: Publish to NuGet Repository
+        id: publish-nuget
+        if: inputs.repository-format == 'nuget'
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          REPO="${{ inputs.repository-name }}"
+          PKG_NAME="${{ inputs.artifact-id }}"
+          VERSION="${{ inputs.version }}"
+          
+          REPO_URL="${NEXUS_URL}/repository/${REPO}/"
+          
+          cd ./artifact
+          
+          NUPKG_FILE=$(find . -name "*.nupkg" -not -name "*.symbols.nupkg" | head -1)
+          
+          if [[ -z "$NUPKG_FILE" ]] || [[ ! -f "$NUPKG_FILE" ]]; then
+            echo "::error::No .nupkg file found"
+            exit 1
+          fi
+          
+          echo "Found package: $NUPKG_FILE"
+          
+          dotnet nuget add source "$REPO_URL" \
+            --name "nexus" \
+            --username "${NEXUS_USERNAME}" \
+            --password "${NEXUS_PASSWORD}" \
+            --store-password-in-clear-text 2>/dev/null || true
+          
+          dotnet nuget push "$NUPKG_FILE" \
+            --source "nexus" \
+            --skip-duplicate
+          
+          PUBLISHED_URL="${REPO_URL}${PKG_NAME}/${VERSION}"
+          
+          echo "url=$PUBLISHED_URL" >> $GITHUB_OUTPUT
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "✅ Successfully published to: $PUBLISHED_URL"
+
+      - name: Publish to Raw Repository
+        id: publish-raw
+        if: inputs.repository-format == 'raw'
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          REPO="${{ inputs.repository-name }}"
+          GROUP="${{ inputs.group-id }}"
+          ARTIFACT_ID="${{ inputs.artifact-id }}"
+          VERSION="${{ inputs.version }}"
+          
+          cd ./artifact
+          
+          # Find artifact file
+          ARTIFACT_FILE=$(ls -1 | head -1)
+          FILENAME=$(basename "$ARTIFACT_FILE")
+          
+          if [[ -n "$GROUP" ]]; then
+            UPLOAD_PATH="${GROUP}/${ARTIFACT_ID}/${VERSION}/${FILENAME}"
+          else
+            UPLOAD_PATH="${ARTIFACT_ID}/${VERSION}/${FILENAME}"
+          fi
+          
+          UPLOAD_URL="${NEXUS_URL}/repository/${REPO}/${UPLOAD_PATH}"
+          
+          echo "Publishing to: $UPLOAD_URL"
+          
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+            --upload-file "$ARTIFACT_FILE" \
+            "$UPLOAD_URL")
+          
+          if [[ "$HTTP_STATUS" =~ ^2[0-9][0-9]$ ]]; then
+            echo "url=$UPLOAD_URL" >> $GITHUB_OUTPUT
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "✅ Successfully published to: $UPLOAD_URL"
+          else
+            echo "::error::Failed to publish artifact. HTTP status: $HTTP_STATUS"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Set Combined Output
+        id: set-output
+        run: |
+          case "${{ inputs.repository-format }}" in
+            maven)
+              echo "url=${{ steps.publish-maven.outputs.url }}" >> $GITHUB_OUTPUT
+              echo "status=${{ steps.publish-maven.outputs.status }}" >> $GITHUB_OUTPUT
+              ;;
+            npm)
+              echo "url=${{ steps.publish-npm.outputs.url }}" >> $GITHUB_OUTPUT
+              echo "status=${{ steps.publish-npm.outputs.status }}" >> $GITHUB_OUTPUT
+              ;;
+            pypi)
+              echo "url=${{ steps.publish-pypi.outputs.url }}" >> $GITHUB_OUTPUT
+              echo "status=${{ steps.publish-pypi.outputs.status }}" >> $GITHUB_OUTPUT
+              ;;
+            nuget)
+              echo "url=${{ steps.publish-nuget.outputs.url }}" >> $GITHUB_OUTPUT
+              echo "status=${{ steps.publish-nuget.outputs.status }}" >> $GITHUB_OUTPUT
+              ;;
+            raw)
+              echo "url=${{ steps.publish-raw.outputs.url }}" >> $GITHUB_OUTPUT
+              echo "status=${{ steps.publish-raw.outputs.status }}" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      - name: Publish Summary
+        run: |
+          echo "## 📦 Nexus Publication Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Repository | ${{ inputs.repository-name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Format | ${{ inputs.repository-format }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact | ${{ inputs.artifact-id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ inputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ steps.set-output.outputs.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| URL | [${{ steps.set-output.outputs.url }}](${{ steps.set-output.outputs.url }}) |" >> $GITHUB_STEP_SUMMARY

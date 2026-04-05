@@ -1,0 +1,103 @@
+# =============================================================================
+# EXAMPLE: Node.js CI/CD Pipeline
+# =============================================================================
+# This pipeline demonstrates how to call reusable workflows from a central
+# repository (e.g., your-org/shared-workflows) from your application repository.
+#
+# SETUP INSTRUCTIONS:
+# 1. Store the reusable workflows in a central repository (e.g., your-org/shared-workflows)
+# 2. Update the 'uses' references below to point to your central repository
+# 3. Configure the required secrets in your repository settings
+# =============================================================================
+
+name: Node.js CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ============================================
+  # Stage 1: Build
+  # ============================================
+  build:
+    uses: your-org/shared-workflows/.github/workflows/build-nodejs.yml@main
+    with:
+      node-version: '20'
+      package-manager: 'npm'  # or 'yarn', 'pnpm'
+      working-directory: '.'
+      artifact-name: 'nodejs-build-artifact'
+      run-tests: true
+      output-directory: 'dist'
+
+  # ============================================
+  # Stage 2: Security Scans (Parallel)
+  # ============================================
+  veracode-scan:
+    needs: build
+    uses: your-org/shared-workflows/.github/workflows/scan-veracode.yml@main
+    with:
+      artifact-name: 'nodejs-build-artifact'
+      application-name: ${{ github.event.repository.name }}
+      scan-type: ${{ github.ref == 'refs/heads/main' && 'policy' || 'sandbox' }}
+      fail-on-severity: 'High'
+    secrets:
+      VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+      VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+
+  nexus-iq-scan:
+    needs: build
+    uses: your-org/shared-workflows/.github/workflows/scan-nexus-iq.yml@main
+    with:
+      artifact-name: 'nodejs-build-artifact'
+      application-id: ${{ github.event.repository.name }}
+      stage: ${{ github.ref == 'refs/heads/main' && 'release' || 'build' }}
+      fail-on-policy-warnings: false
+      scan-targets: '**/package-lock.json,**/yarn.lock,**/pnpm-lock.yaml'
+    secrets:
+      NEXUS_IQ_URL: ${{ secrets.NEXUS_IQ_URL }}
+      NEXUS_IQ_USERNAME: ${{ secrets.NEXUS_IQ_USERNAME }}
+      NEXUS_IQ_PASSWORD: ${{ secrets.NEXUS_IQ_PASSWORD }}
+
+  # ============================================
+  # Stage 3: Publish to Nexus (Stage)
+  # ============================================
+  publish-staging:
+    needs: [build, veracode-scan, nexus-iq-scan]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    uses: your-org/shared-workflows/.github/workflows/publish-nexus.yml@main
+    with:
+      artifact-name: 'nodejs-build-artifact'
+      repository-format: 'npm'
+      repository-name: ${{ github.ref == 'refs/heads/main' && 'npm-releases' || 'npm-snapshots' }}
+      group-id: '@myorg'  # npm scope (optional)
+      artifact-id: 'my-nodejs-app'
+      version: ${{ needs.build.outputs.version }}
+    secrets:
+      NEXUS_URL: ${{ secrets.NEXUS_URL }}
+      NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+  # ============================================
+  # Summary Job
+  # ============================================
+  pipeline-summary:
+    needs: [build, veracode-scan, nexus-iq-scan, publish-staging]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pipeline Summary
+        run: |
+          echo "## 📦 Node.js Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Veracode Scan | ${{ needs.veracode-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Nexus IQ Scan | ${{ needs.nexus-iq-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Publish Staging | ${{ needs.publish-staging.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ needs.build.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Published URL:** ${{ needs.publish-staging.outputs.published-url }}" >> $GITHUB_STEP_SUMMARY

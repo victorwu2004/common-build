@@ -1,0 +1,184 @@
+name: Build Node.js Application
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: 'Node.js version'
+        required: false
+        type: string
+        default: '20'
+      package-manager:
+        description: 'Package manager (npm, yarn, pnpm)'
+        required: false
+        type: string
+        default: 'npm'
+      working-directory:
+        description: 'Working directory'
+        required: false
+        type: string
+        default: '.'
+      artifact-name:
+        description: 'Name for the build artifact'
+        required: true
+        type: string
+      run-tests:
+        description: 'Run unit tests'
+        required: false
+        type: boolean
+        default: true
+      build-command:
+        description: 'Custom build command'
+        required: false
+        type: string
+        default: ''
+      test-command:
+        description: 'Custom test command'
+        required: false
+        type: string
+        default: ''
+      output-directory:
+        description: 'Build output directory'
+        required: false
+        type: string
+        default: 'dist'
+    outputs:
+      artifact-name:
+        description: 'Name of the uploaded artifact'
+        value: ${{ jobs.build.outputs.artifact-name }}
+      version:
+        description: 'Build version'
+        value: ${{ jobs.build.outputs.version }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-name: ${{ inputs.artifact-name }}
+      version: ${{ steps.version.outputs.version }}
+    
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        if: inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@v3
+        with:
+          version: 8
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Generate version
+        id: version
+        run: |
+          BASE_VERSION=$(node -p "require('./package.json').version" 2>/dev/null || echo "1.0.0")
+          if [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == "refs/heads/master" ]]; then
+            VERSION="${BASE_VERSION}"
+          else
+            VERSION="${BASE_VERSION}-build.${{ github.run_number }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Generated version: $VERSION"
+
+      - name: Install dependencies (npm)
+        if: inputs.package-manager == 'npm'
+        run: npm ci
+
+      - name: Install dependencies (yarn)
+        if: inputs.package-manager == 'yarn'
+        run: yarn install --frozen-lockfile
+
+      - name: Install dependencies (pnpm)
+        if: inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+
+      - name: Run linting
+        run: |
+          if [[ "${{ inputs.package-manager }}" == "npm" ]]; then
+            npm run lint --if-present
+          elif [[ "${{ inputs.package-manager }}" == "yarn" ]]; then
+            yarn lint --if-present || true
+          else
+            pnpm lint --if-present || true
+          fi
+        continue-on-error: true
+
+      - name: Run tests
+        if: inputs.run-tests
+        run: |
+          if [[ -n "${{ inputs.test-command }}" ]]; then
+            ${{ inputs.test-command }}
+          elif [[ "${{ inputs.package-manager }}" == "npm" ]]; then
+            npm test --if-present
+          elif [[ "${{ inputs.package-manager }}" == "yarn" ]]; then
+            yarn test --if-present || true
+          else
+            pnpm test --if-present || true
+          fi
+
+      - name: Upload test results
+        if: inputs.run-tests && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}-test-results
+          path: |
+            ${{ inputs.working-directory }}/coverage
+            ${{ inputs.working-directory }}/test-results
+            ${{ inputs.working-directory }}/junit.xml
+          retention-days: 7
+        continue-on-error: true
+
+      - name: Build
+        run: |
+          if [[ -n "${{ inputs.build-command }}" ]]; then
+            ${{ inputs.build-command }}
+          elif [[ "${{ inputs.package-manager }}" == "npm" ]]; then
+            npm run build --if-present
+          elif [[ "${{ inputs.package-manager }}" == "yarn" ]]; then
+            yarn build --if-present || true
+          else
+            pnpm build --if-present || true
+          fi
+
+      - name: Package artifacts
+        run: |
+          mkdir -p ./build-package
+          
+          if [[ -d "${{ inputs.output-directory }}" ]]; then
+            cp -r ${{ inputs.output-directory }}/* ./build-package/
+          fi
+          
+          cp package.json ./build-package/
+          
+          cd build-package
+          zip -r ../build-artifacts.zip .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.working-directory }}/build-artifacts.zip
+          retention-days: 5
+
+      - name: Build Summary
+        run: |
+          echo "## 📦 Node.js Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Node.js Version | ${{ inputs.node-version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Package Manager | ${{ inputs.package-manager }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ steps.version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests Run | ${{ inputs.run-tests }} |" >> $GITHUB_STEP_SUMMARY
