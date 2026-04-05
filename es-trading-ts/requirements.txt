@@ -1,0 +1,18 @@
+# ES Dual Agent Trading System for TradeStation
+# EMA Crossover + TTM Squeeze Strategy
+# Requirements
+
+# HTTP client for TradeStation API
+requests>=2.31.0
+
+# Numeric operations (for indicators)
+numpy>=1.24.0
+
+# Timezone handling
+pytz>=2023.3
+
+# Optional: For data analysis and backtesting
+pandas>=2.0.0
+
+# Optional: For visualization
+# matplotlib>=3.7.0
