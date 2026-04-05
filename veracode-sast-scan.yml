@@ -1,0 +1,196 @@
+# =============================================================================
+# Reusable Workflow: veracode-sast-scan.yml
+# Path: .github/workflows/veracode-sast-scan.yml
+#
+# Calls the veracode-scan composite action.
+# Designed to be called from any application build workflow.
+#
+# Usage (from caller workflow):
+#
+#   jobs:
+#     sast:
+#       uses: your-org/.github/.github/workflows/veracode-sast-scan.yml@main
+#       with:
+#         app_name: 'MyApp'
+#         artifact_path: '/path/to/myapp.zip'
+#         sandbox_name: 'feature-branch-sandbox'   # omit for policy scan
+#       secrets:
+#         VERACODE_API_ID:  ${{ secrets.VERACODE_API_ID }}
+#         VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+# =============================================================================
+
+name: Veracode SAST Scan
+
+on:
+  workflow_call:
+    inputs:
+      # --- Required ---
+      app_name:
+        description: 'Veracode application profile name'
+        type: string
+        required: true
+      artifact_path:
+        description: 'Path to the ZIP/JAR/WAR artifact to scan'
+        type: string
+        required: true
+
+      # --- Optional targeting ---
+      sandbox_name:
+        description: 'Sandbox name. Empty = policy scan.'
+        type: string
+        required: false
+        default: ''
+      create_sandbox:
+        description: 'Create sandbox if it does not exist'
+        type: boolean
+        required: false
+        default: true
+
+      # --- Scan behaviour ---
+      wait_for_results:
+        description: 'Poll until Results Ready'
+        type: boolean
+        required: false
+        default: true
+      scan_timeout_minutes:
+        description: 'Max minutes to wait for results (0 = unlimited)'
+        type: number
+        required: false
+        default: 60
+      fail_on_policy_violation:
+        description: 'Treat a policy violation as a failure condition'
+        type: boolean
+        required: false
+        default: true
+      fail_workflow_on_error:
+        description: >
+          false = action emits ::error:: annotations but exits 0 so the workflow
+          continues. Use scan_failed / scan_outcome outputs for downstream gating.
+        type: boolean
+        required: false
+        default: true
+      preflight_mode:
+        description: 'safe | force | none'
+        type: string
+        required: false
+        default: 'safe'
+      include_modules:
+        description: 'Comma-separated module include patterns'
+        type: string
+        required: false
+        default: ''
+      exclude_modules:
+        description: 'Comma-separated module exclude patterns'
+        type: string
+        required: false
+        default: ''
+      scan_all_nonfatal_top_level_modules:
+        description: 'Scan all non-fatal top-level modules'
+        type: boolean
+        required: false
+        default: false
+
+      # --- JAR / Nexus ---
+      jar_version:
+        description: 'Pin the Veracode JAR version. Empty = resolve latest.'
+        type: string
+        required: false
+        default: ''
+      nexus_jar_base_url:
+        description: 'Nexus Maven proxy base URL for JAR download'
+        type: string
+        required: false
+        default: ''
+
+      # --- Runner ---
+      runner_label:
+        description: 'Runner label to use for the scan job'
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+
+    secrets:
+      VERACODE_API_ID:
+        required: true
+      VERACODE_API_KEY:
+        required: true
+      NEXUS_USERNAME:
+        required: false
+      NEXUS_PASSWORD:
+        required: false
+
+    outputs:
+      scan_outcome:
+        description: 'submitted | policy_pass | policy_fail | timed_out | upload_failed'
+        value: ${{ jobs.veracode-scan.outputs.scan_outcome }}
+      scan_failed:
+        description: 'true if any error was detected, regardless of fail_workflow_on_error'
+        value: ${{ jobs.veracode-scan.outputs.scan_failed }}
+      policy_compliance:
+        description: 'Pass | Did Not Pass | Not Assessed | unknown'
+        value: ${{ jobs.veracode-scan.outputs.policy_compliance }}
+      build_id:
+        description: 'Veracode build ID'
+        value: ${{ jobs.veracode-scan.outputs.build_id }}
+      final_status:
+        description: 'Final Veracode build status string'
+        value: ${{ jobs.veracode-scan.outputs.final_status }}
+
+jobs:
+  veracode-scan:
+    name: 'Veracode SAST — ${{ inputs.app_name }}'
+    runs-on: ${{ inputs.runner_label }}
+
+    outputs:
+      scan_outcome:       ${{ steps.scan.outputs.scan_outcome }}
+      scan_failed:        ${{ steps.scan.outputs.scan_failed }}
+      policy_compliance:  ${{ steps.scan.outputs.policy_compliance }}
+      build_id:           ${{ steps.scan.outputs.build_id }}
+      final_status:       ${{ steps.scan.outputs.final_status }}
+
+    steps:
+      # Checkout needed so the composite action path resolves correctly
+      # when the action lives in the same .github repo
+      - name: Checkout actions repo
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions/veracode-scan
+
+      - name: Veracode Upload and Scan
+        id: scan
+        uses: ./.github/actions/veracode-scan
+        with:
+          vid:                               ${{ secrets.VERACODE_API_ID }}
+          vkey:                              ${{ secrets.VERACODE_API_KEY }}
+          app_name:                          ${{ inputs.app_name }}
+          artifact_path:                     ${{ inputs.artifact_path }}
+          sandbox_name:                      ${{ inputs.sandbox_name }}
+          create_sandbox:                    ${{ inputs.create_sandbox }}
+          wait_for_results:                  ${{ inputs.wait_for_results }}
+          scan_timeout_minutes:              ${{ inputs.scan_timeout_minutes }}
+          fail_on_policy_violation:          ${{ inputs.fail_on_policy_violation }}
+          fail_workflow_on_error:            ${{ inputs.fail_workflow_on_error }}
+          preflight_mode:                    ${{ inputs.preflight_mode }}
+          include_modules:                   ${{ inputs.include_modules }}
+          exclude_modules:                   ${{ inputs.exclude_modules }}
+          scan_all_nonfatal_top_level_modules: ${{ inputs.scan_all_nonfatal_top_level_modules }}
+          jar_version:                       ${{ inputs.jar_version }}
+          nexus_jar_base_url:                ${{ inputs.nexus_jar_base_url }}
+          nexus_username:                    ${{ secrets.NEXUS_USERNAME }}
+          nexus_password:                    ${{ secrets.NEXUS_PASSWORD }}
+
+      # Optional: downstream gate step — only runs when wait_for_results=true
+      - name: Enforce policy gate
+        if: >
+          inputs.wait_for_results == true &&
+          inputs.fail_on_policy_violation == true &&
+          steps.scan.outputs.policy_compliance == 'Did Not Pass'
+        shell: bash
+        run: |
+          echo "::error title=Policy Gate Failed::Veracode policy was not passed."
+          echo "Build ID    : ${{ steps.scan.outputs.build_id }}"
+          echo "Outcome     : ${{ steps.scan.outputs.scan_outcome }}"
+          echo "Compliance  : ${{ steps.scan.outputs.policy_compliance }}"
+          echo ""
+          echo "Review findings at https://analysiscenter.veracode.com"
+          exit 1

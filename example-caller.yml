@@ -1,0 +1,187 @@
+# =============================================================================
+# Example: Application pipeline calling the Veracode reusable workflow
+# Path: (in your application repo) .github/workflows/ci.yml
+#
+# Demonstrates:
+#   - Policy scan on main branch (wait for results, break build on failure)
+#   - Sandbox scan on feature branches (wait for results, no build break)
+#   - Fire-and-forget sandbox scan variant (don't wait, fastest pipeline)
+# =============================================================================
+
+name: CI Build + Veracode Scan
+
+on:
+  push:
+    branches: [main, 'feature/**', 'release/**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build job — produces the artifact
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build
+    runs-on: [self-hosted, windows, build]
+    outputs:
+      artifact_name: ${{ steps.set-artifact.outputs.name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build application
+        shell: pwsh
+        run: |
+          # ... your existing build steps (MSBuild / dotnet / Maven / etc.) ...
+          Write-Host "Build complete"
+
+      - name: Set artifact name
+        id: set-artifact
+        shell: pwsh
+        run: echo "name=myapp-${{ github.run_id }}.zip" >> $env:GITHUB_OUTPUT
+
+      - name: Upload artifact to workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-artifact
+          path: drop/myapp.zip
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Veracode policy scan — main branch
+  # Waits for results. Fails the workflow if policy is not passed.
+  # This is the default, strictest mode.
+  # ---------------------------------------------------------------------------
+  veracode-policy:
+    name: Veracode Policy Scan
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    uses: your-org/.github/.github/workflows/veracode-sast-scan.yml@main
+    with:
+      app_name:                 'MyApp-Production'
+      artifact_path:            '${{ github.workspace }}/drop/myapp.zip'
+      sandbox_name:             ''
+      wait_for_results:         true
+      scan_timeout_minutes:     90
+      fail_on_policy_violation: true
+      fail_workflow_on_error:   true     # default: policy fail = workflow red + stops here
+      preflight_mode:           'safe'
+      runner_label:             'ubuntu-latest'
+    secrets:
+      VERACODE_API_ID:          ${{ secrets.VERACODE_API_ID }}
+      VERACODE_API_KEY:         ${{ secrets.VERACODE_API_KEY }}
+      NEXUS_USERNAME:           ${{ secrets.NEXUS_USER }}
+      NEXUS_PASSWORD:           ${{ secrets.NEXUS_PASS }}
+
+  # ---------------------------------------------------------------------------
+  # Veracode sandbox scan — feature branches
+  # Waits for results. Shows a red annotation on the scan step if policy fails,
+  # but the workflow continues so the PR is not blocked.
+  # A separate gate job below reads scan_failed and can optionally post a
+  # PR comment or set a commit status without hard-failing the branch.
+  # ---------------------------------------------------------------------------
+  veracode-sandbox:
+    name: Veracode Sandbox Scan
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    needs: build
+    uses: your-org/.github/.github/workflows/veracode-sast-scan.yml@main
+    with:
+      app_name:                 'MyApp-Production'
+      artifact_path:            '${{ github.workspace }}/drop/myapp.zip'
+      sandbox_name:             'feature-branch-ci'
+      create_sandbox:           true
+      wait_for_results:         true
+      scan_timeout_minutes:     60
+      fail_on_policy_violation: true     # still mark as an error condition…
+      fail_workflow_on_error:   false    # …but don't kill the workflow
+      preflight_mode:           'force'
+      runner_label:             'ubuntu-latest'
+    secrets:
+      VERACODE_API_ID:          ${{ secrets.VERACODE_API_ID }}
+      VERACODE_API_KEY:         ${{ secrets.VERACODE_API_KEY }}
+
+  # ---------------------------------------------------------------------------
+  # Downstream gate — runs after the sandbox scan regardless of its outcome
+  # because veracode-sandbox uses fail_workflow_on_error=false.
+  # This job reads scan_failed and decides what to do — post a comment,
+  # set a commit status, notify a channel, etc. — without hard-blocking CI.
+  # ---------------------------------------------------------------------------
+  veracode-gate:
+    name: Veracode Result Gate
+    if: startsWith(github.ref, 'refs/heads/feature/')
+    needs: veracode-sandbox
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate Veracode results
+        shell: bash
+        run: |
+          OUTCOME="${{ needs.veracode-sandbox.outputs.scan_outcome }}"
+          FAILED="${{ needs.veracode-sandbox.outputs.scan_failed }}"
+          POLICY="${{ needs.veracode-sandbox.outputs.policy_compliance }}"
+          BUILD_ID="${{ needs.veracode-sandbox.outputs.build_id }}"
+
+          echo "Scan outcome    : $OUTCOME"
+          echo "Scan failed     : $FAILED"
+          echo "Policy result   : $POLICY"
+          echo "Build ID        : $BUILD_ID"
+
+          if [[ "$FAILED" == "true" ]]; then
+            echo "::warning title=Veracode Gate::Scan outcome was '$OUTCOME' (policy: '$POLICY')."
+            echo "Review findings before merging to main:"
+            echo "  https://analysiscenter.veracode.com"
+            # Add your notification here:
+            # - Post a PR comment via gh cli
+            # - Update a commit status via GitHub REST API
+            # - Send a Teams/Slack webhook
+            # - Write to a compliance log
+            # Do NOT exit 1 here unless you want to block the branch.
+          else
+            echo "Veracode scan passed — no gate action required."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # (Alternative) Fire-and-forget — fastest pipeline, no waiting at all
+  # ---------------------------------------------------------------------------
+  # veracode-async:
+  #   name: Veracode Scan (async)
+  #   needs: build
+  #   uses: your-org/.github/.github/workflows/veracode-sast-scan.yml@main
+  #   with:
+  #     app_name:               'MyApp-Production'
+  #     artifact_path:          '${{ github.workspace }}/drop/myapp.zip'
+  #     sandbox_name:           'feature-branch-ci'
+  #     wait_for_results:       false    # submit only; no polling; no outcome available
+  #     fail_workflow_on_error: false    # upload errors also non-fatal
+  #     preflight_mode:         'force'
+  #   secrets:
+  #     VERACODE_API_ID:        ${{ secrets.VERACODE_API_ID }}
+  #     VERACODE_API_KEY:       ${{ secrets.VERACODE_API_KEY }}
+
+  # ---------------------------------------------------------------------------
+  # Gate downstream deploy on Veracode policy pass (main branch only)
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy
+    if: github.ref == 'refs/heads/main'
+    needs: [build, veracode-policy]
+    runs-on: [self-hosted, linux, deploy]
+    steps:
+      - name: Verify Veracode gate before deploy
+        shell: bash
+        run: |
+          # On main, veracode-policy uses fail_workflow_on_error=true so this job
+          # would never even run if the scan failed. This is a belt-and-suspenders
+          # check using the outputs in case someone changes the flags later.
+          OUTCOME="${{ needs.veracode-policy.outputs.scan_outcome }}"
+          FAILED="${{ needs.veracode-policy.outputs.scan_failed }}"
+          if [[ "$FAILED" == "true" ]]; then
+            echo "::error::Deploy blocked — Veracode scan_failed=true (outcome: $OUTCOME)"
+            exit 1
+          fi
+          echo "Veracode gate passed (outcome: $OUTCOME) — proceeding with deploy."
+
+      - name: Trigger AAP deployment
+        shell: bash
+        run: |
+          echo "Triggering Ansible Automation Platform deployment..."
+          # curl -X POST https://aap.corp.example.com/api/v2/job_templates/.../launch/ ...
