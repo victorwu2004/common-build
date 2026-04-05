@@ -96,76 +96,104 @@ class LongAgent:
         current_price: float,
         ask_price: float
     ) -> TradeSignal:
-        """Check for bullish entry signals"""
+        """
+        Check for bullish entry signals using EMA Crossover + TTM Squeeze strategy.
+        
+        Entry conditions:
+        1. EMA 8 > EMA 21 (bullish trend)
+        2. TTM Squeeze has fired (squeeze off) OR momentum is bullish
+        3. Squeeze momentum is positive (bullish)
+        4. Momentum is rising (increasing)
+        """
         
         reasons = []
         score = 0.0
         
-        # 1. EMA Crossover (Trend)
+        # =================================================================
+        # PRIMARY FILTER: EMA Crossover (REQUIRED)
+        # =================================================================
         if indicators.ema_fast > indicators.ema_slow:
-            score += 0.2
-            reasons.append("EMA bullish")
+            score += 0.25
+            reasons.append(f"EMA{self.config.EMA_FAST}x{self.config.EMA_SLOW} bullish")
         else:
             return TradeSignal(
                 agent_type=self.agent_type,
                 action="HOLD",
                 side=OrderAction.BUY,
                 quantity=0,
-                reason="EMA bearish - no long entry"
+                reason=f"EMA bearish ({indicators.ema_fast:.2f} < {indicators.ema_slow:.2f})"
             )
         
-        # 2. RSI Conditions
+        # =================================================================
+        # TTM SQUEEZE CONDITIONS
+        # =================================================================
+        
+        # Check squeeze state
+        if self.config.TTM_SQUEEZE_REQUIRED:
+            # Squeeze must have fired (was on, now off) for entry
+            if indicators.squeeze_fired:
+                score += 0.25
+                reasons.append("Squeeze FIRED")
+            elif not indicators.squeeze_on:
+                # Squeeze is off but didn't just fire - still okay if momentum confirms
+                score += 0.1
+                reasons.append("Squeeze off")
+            else:
+                # Squeeze is still on - wait for it to fire
+                return TradeSignal(
+                    agent_type=self.agent_type,
+                    action="HOLD",
+                    side=OrderAction.BUY,
+                    quantity=0,
+                    reason="Squeeze ON - waiting for fire"
+                )
+        
+        # Momentum direction must be bullish
+        if indicators.squeeze_direction == 1:  # Bullish
+            score += 0.2
+            reasons.append(f"Momentum bullish ({indicators.squeeze_momentum:.2f})")
+        elif indicators.squeeze_direction == -1:  # Bearish
+            return TradeSignal(
+                agent_type=self.agent_type,
+                action="HOLD",
+                side=OrderAction.BUY,
+                quantity=0,
+                reason=f"Momentum bearish ({indicators.squeeze_momentum:.2f})"
+            )
+        
+        # Momentum should be rising (bars getting taller)
+        if indicators.squeeze_momentum_rising:
+            score += 0.15
+            reasons.append("Momentum rising")
+        
+        # =================================================================
+        # SECONDARY CONFIRMATIONS (Optional boosters)
+        # =================================================================
+        
+        # RSI not overbought
         if indicators.rsi < self.config.RSI_OVERBOUGHT:
             if indicators.rsi > 40:
-                score += 0.15
-                reasons.append(f"RSI favorable ({indicators.rsi:.1f})")
-            if 30 < indicators.rsi < 45:
-                score += 0.15
-                reasons.append("RSI oversold bounce")
+                score += 0.05
+                reasons.append(f"RSI OK ({indicators.rsi:.1f})")
         else:
-            return TradeSignal(
-                agent_type=self.agent_type,
-                action="HOLD",
-                side=OrderAction.BUY,
-                quantity=0,
-                reason=f"RSI overbought ({indicators.rsi:.1f})"
-            )
+            # RSI overbought - reduce score but don't block
+            score -= 0.1
+            reasons.append(f"RSI high ({indicators.rsi:.1f})")
         
-        # 3. VWAP
+        # Price above VWAP (optional confirmation)
         if current_price > indicators.vwap:
-            score += 0.15
+            score += 0.05
             reasons.append("Above VWAP")
         
-        # 4. MACD
-        if indicators.macd_histogram > 0:
-            score += 0.15
-            reasons.append("MACD positive")
-        elif indicators.macd > indicators.macd_signal:
-            score += 0.1
-            reasons.append("MACD bullish crossover")
-        
-        # 5. ADX (Trend Strength)
-        if indicators.adx > 20:
-            if indicators.plus_di > indicators.minus_di:
-                score += 0.15
-                reasons.append(f"ADX trending bullish ({indicators.adx:.1f})")
-        
-        # 6. Bollinger Bands
-        if current_price < indicators.bollinger_middle:
+        # ADX trending (optional confirmation)
+        if indicators.adx > 20 and indicators.plus_di > indicators.minus_di:
             score += 0.05
-            reasons.append("Below BB middle (value)")
+            reasons.append(f"ADX confirms ({indicators.adx:.1f})")
         
-        # 7. Stochastic
-        if indicators.stochastic_k < 80 and indicators.stochastic_k > indicators.stochastic_d:
-            score += 0.1
-            reasons.append("Stochastic bullish")
-        
-        # 8. Volume confirmation
-        if indicators.current_volume > indicators.volume_sma * 1.2:
-            score += 0.05
-            reasons.append("Volume above average")
-        
-        # Decision
+        # =================================================================
+        # DECISION
+        # =================================================================
+        # Require minimum score of 0.5 for entry
         if score >= 0.5:
             atr = indicators.atr if indicators.atr > 0 else ticks_to_points(self.config.STOP_LOSS_TICKS)
             
@@ -189,7 +217,7 @@ class LongAgent:
             action="HOLD",
             side=OrderAction.BUY,
             quantity=0,
-            reason=f"Score too low ({score:.2f}): " + ", ".join(reasons) if reasons else "No signals",
+            reason=f"Score {score:.2f}: " + ", ".join(reasons) if reasons else "No signals",
             confidence=score
         )
     
@@ -383,6 +411,10 @@ class LongAgent:
                 "ema_fast": self.last_indicators.ema_fast if self.last_indicators else 0,
                 "ema_slow": self.last_indicators.ema_slow if self.last_indicators else 0,
                 "rsi": self.last_indicators.rsi if self.last_indicators else 0,
-                "macd": self.last_indicators.macd_histogram if self.last_indicators else 0
+                "macd": self.last_indicators.macd_histogram if self.last_indicators else 0,
+                "squeeze_on": self.last_indicators.squeeze_on if self.last_indicators else False,
+                "squeeze_fired": self.last_indicators.squeeze_fired if self.last_indicators else False,
+                "squeeze_momentum": self.last_indicators.squeeze_momentum if self.last_indicators else 0,
+                "squeeze_direction": self.last_indicators.squeeze_direction if self.last_indicators else 0
             }
         }

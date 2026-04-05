@@ -1,10 +1,35 @@
 # ES Dual Agent Trading System - Interactive Brokers
+## EMA Crossover + TTM Squeeze Strategy
 
 Automated E-mini S&P 500 (ES) futures trading system for Interactive Brokers using the `ib_insync` library.
 
+This system implements **John Carter's TTM Squeeze** combined with **EMA Crossover** signals - the same strategy visible in your ThinkOrSwim chart.
+
 Two independent agents:
-- **Long Agent**: Looks for bullish setups and enters long positions
-- **Short Agent**: Looks for bearish setups and enters short positions
+- **Long Agent**: Enters when EMA crosses bullish AND squeeze fires with positive momentum
+- **Short Agent**: Enters when EMA crosses bearish AND squeeze fires with negative momentum
+
+## Strategy Logic
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     TTM SQUEEZE + EMA                        │
+│                                                              │
+│  SQUEEZE ON (Red dots)     SQUEEZE FIRES (Green dots)       │
+│  ════════════════════      ══════════════════════════       │
+│  • Low volatility          • Volatility expanding            │
+│  • BB inside KC            • BB outside KC                   │
+│  • Consolidation           • BREAKOUT IMMINENT               │
+│  • NO ENTRY                • CHECK MOMENTUM + EMA            │
+│                                                              │
+│  LONG ENTRY:                SHORT ENTRY:                     │
+│  ───────────                ────────────                     │
+│  • EMA 8 > EMA 21          • EMA 8 < EMA 21                  │
+│  • Squeeze fired/off       • Squeeze fired/off               │
+│  • Momentum positive       • Momentum negative               │
+│  • Momentum rising         • Momentum rising (in magnitude) │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ## Architecture
 
@@ -141,6 +166,17 @@ TAKE_PROFIT_TICKS = 40    # 10 points = $500/contract
 MAX_DAILY_LOSS = 1000.0   # Stop trading after losing $1000
 MAX_DAILY_TRADES = 10
 
+# EMA Crossover settings (matching your chart)
+EMA_FAST = 8              # Fast EMA period
+EMA_SLOW = 21             # Slow EMA period
+
+# TTM Squeeze parameters (from your chart: TTM_Squeeze(CLOSE, 20, 1.5, 2.0, 1.0))
+TTM_BB_PERIOD = 20        # Bollinger Bands period
+TTM_BB_MULT = 2.0         # Bollinger Bands std dev multiplier
+TTM_KC_PERIOD = 20        # Keltner Channel period
+TTM_KC_MULT = 1.5         # Keltner Channel ATR multiplier
+TTM_SQUEEZE_REQUIRED = True  # Require squeeze fire for entry
+
 # Trading hours
 USE_RTH_ONLY = False      # True = 9:30 AM - 4:00 PM ET only
 
@@ -162,24 +198,37 @@ BAR_SIZE = "5 mins"       # Candle size for analysis
 
 ## Trading Logic
 
+### TTM Squeeze Explained
+
+The TTM Squeeze detects periods of low volatility (consolidation) that precede big moves:
+
+| Indicator State | Meaning |
+|-----------------|---------|
+| **Squeeze ON** (red dots) | Bollinger Bands inside Keltner Channels = low volatility, consolidation |
+| **Squeeze OFF** (green dots) | BB outside KC = volatility expanding, potential breakout |
+| **Squeeze FIRED** | Transition from ON → OFF = breakout imminent! |
+| **Momentum +** (cyan bars) | Bullish momentum |
+| **Momentum -** (red bars) | Bearish momentum |
+| **Momentum Rising** | Bars getting taller = momentum increasing |
+
 ### Long Agent Entry Conditions
-- EMA(9) > EMA(21) - Uptrend
-- RSI between 30-70 - Not extreme
-- Price above VWAP - Bullish
-- MACD histogram positive - Momentum
-- ADX > 20 with +DI > -DI - Trending up
+1. **EMA 8 > EMA 21** - Bullish trend (REQUIRED)
+2. **Squeeze has fired** - Was ON, now OFF (REQUIRED if `TTM_SQUEEZE_REQUIRED=True`)
+3. **Momentum positive** - Histogram above zero (REQUIRED)
+4. **Momentum rising** - Bars getting taller (bonus points)
+5. RSI not overbought, above VWAP, ADX confirms (optional boosters)
 
 ### Short Agent Entry Conditions
-- EMA(9) < EMA(21) - Downtrend
-- RSI between 30-70 - Not extreme
-- Price below VWAP - Bearish
-- MACD histogram negative - Momentum
-- ADX > 20 with -DI > +DI - Trending down
+1. **EMA 8 < EMA 21** - Bearish trend (REQUIRED)
+2. **Squeeze has fired** - Was ON, now OFF (REQUIRED if `TTM_SQUEEZE_REQUIRED=True`)
+3. **Momentum negative** - Histogram below zero (REQUIRED)
+4. **Momentum rising** - Bars getting taller downward (bonus points)
+5. RSI not oversold, below VWAP, ADX confirms (optional boosters)
 
 ### Exit Conditions
-- Stop loss hit
-- Take profit hit
-- Trend reversal (EMA crossover)
+- Stop loss hit (ATR-based)
+- Take profit hit (ATR-based)
+- EMA crossover reversal
 - Extreme RSI (>80 for longs, <20 for shorts)
 
 ## Order Types

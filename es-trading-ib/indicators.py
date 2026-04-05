@@ -26,6 +26,13 @@ class IndicatorValues:
     minus_di: float = 0.0
     volume_sma: float = 0.0
     current_volume: float = 0.0
+    
+    # TTM Squeeze indicators
+    squeeze_on: bool = False          # True = squeeze is active (low volatility)
+    squeeze_fired: bool = False       # True = squeeze just released (breakout)
+    squeeze_momentum: float = 0.0     # Momentum histogram value
+    squeeze_momentum_rising: bool = False  # True = momentum increasing
+    squeeze_direction: int = 0        # 1 = bullish, -1 = bearish, 0 = neutral
 
 
 class TechnicalIndicators:
@@ -311,6 +318,204 @@ class TechnicalIndicators:
         
         return padding + adx, padding + plus_di, padding + minus_di
     
+    @staticmethod
+    def calculate_ttm_squeeze(
+        highs: List[float],
+        lows: List[float],
+        closes: List[float],
+        bb_period: int = 20,
+        bb_mult: float = 2.0,
+        kc_period: int = 20,
+        kc_mult: float = 1.5
+    ) -> Tuple[List[bool], List[float], List[int]]:
+        """
+        Calculate TTM Squeeze indicator (John Carter's squeeze).
+        
+        The squeeze occurs when Bollinger Bands move inside Keltner Channels,
+        indicating low volatility and potential breakout.
+        
+        Args:
+            highs: List of high prices
+            lows: List of low prices
+            closes: List of close prices
+            bb_period: Bollinger Bands period (default 20)
+            bb_mult: Bollinger Bands standard deviation multiplier (default 2.0)
+            kc_period: Keltner Channel period (default 20)
+            kc_mult: Keltner Channel ATR multiplier (default 1.5)
+        
+        Returns:
+            squeeze_on: List of bools - True when squeeze is active
+            momentum: List of momentum values (linear regression of price minus midline)
+            direction: List of direction values (1=bullish, -1=bearish)
+        """
+        n = len(closes)
+        if n < max(bb_period, kc_period) + 10:
+            return [False] * n, [0.0] * n, [0] * n
+        
+        # Calculate Bollinger Bands
+        bb_sma = TechnicalIndicators.calculate_sma(closes, bb_period)
+        bb_upper = []
+        bb_lower = []
+        
+        for i in range(n):
+            if i < bb_period - 1:
+                bb_upper.append(0.0)
+                bb_lower.append(0.0)
+            else:
+                std = np.std(closes[i-bb_period+1:i+1])
+                bb_upper.append(bb_sma[i] + (bb_mult * std))
+                bb_lower.append(bb_sma[i] - (bb_mult * std))
+        
+        # Calculate Keltner Channels (using True Range for ATR)
+        kc_sma = TechnicalIndicators.calculate_sma(closes, kc_period)
+        
+        # Calculate True Range
+        tr = []
+        for i in range(n):
+            if i == 0:
+                tr.append(highs[i] - lows[i])
+            else:
+                tr1 = highs[i] - lows[i]
+                tr2 = abs(highs[i] - closes[i-1])
+                tr3 = abs(lows[i] - closes[i-1])
+                tr.append(max(tr1, tr2, tr3))
+        
+        # ATR for Keltner
+        atr = TechnicalIndicators.calculate_sma(tr, kc_period)
+        
+        kc_upper = []
+        kc_lower = []
+        for i in range(n):
+            kc_upper.append(kc_sma[i] + (kc_mult * atr[i]))
+            kc_lower.append(kc_sma[i] - (kc_mult * atr[i]))
+        
+        # Squeeze detection: BB inside KC = squeeze on
+        squeeze_on = []
+        for i in range(n):
+            if i < max(bb_period, kc_period):
+                squeeze_on.append(False)
+            else:
+                # Squeeze is ON when BB is inside KC
+                is_squeeze = (bb_lower[i] > kc_lower[i]) and (bb_upper[i] < kc_upper[i])
+                squeeze_on.append(is_squeeze)
+        
+        # Calculate momentum using linear regression
+        # Momentum = Linear regression value of (close - avg(highest_high, lowest_low, sma))
+        momentum = []
+        linreg_period = kc_period
+        
+        for i in range(n):
+            if i < linreg_period + kc_period:
+                momentum.append(0.0)
+            else:
+                # Calculate the "donchian midline"
+                highest = max(highs[i-kc_period+1:i+1])
+                lowest = min(lows[i-kc_period+1:i+1])
+                donchian_mid = (highest + lowest) / 2
+                
+                # Average of donchian midline and SMA
+                avg_mid = (donchian_mid + kc_sma[i]) / 2
+                
+                # Delta from average
+                delta = closes[i] - avg_mid
+                
+                # Simple linear regression slope over the period
+                deltas = []
+                for j in range(i - linreg_period + 1, i + 1):
+                    h = max(highs[j-kc_period+1:j+1]) if j >= kc_period else highs[j]
+                    l = min(lows[j-kc_period+1:j+1]) if j >= kc_period else lows[j]
+                    dm = (h + l) / 2
+                    am = (dm + kc_sma[j]) / 2 if j < len(kc_sma) else dm
+                    deltas.append(closes[j] - am)
+                
+                # Linear regression value (using endpoint of linreg)
+                if len(deltas) >= linreg_period:
+                    x = np.arange(linreg_period)
+                    y = np.array(deltas[-linreg_period:])
+                    
+                    # Linear regression: y = mx + b, we want the value at end
+                    x_mean = np.mean(x)
+                    y_mean = np.mean(y)
+                    
+                    numerator = np.sum((x - x_mean) * (y - y_mean))
+                    denominator = np.sum((x - x_mean) ** 2)
+                    
+                    if denominator != 0:
+                        slope = numerator / denominator
+                        intercept = y_mean - slope * x_mean
+                        linreg_value = slope * (linreg_period - 1) + intercept
+                        momentum.append(linreg_value)
+                    else:
+                        momentum.append(delta)
+                else:
+                    momentum.append(delta)
+        
+        # Direction based on momentum
+        direction = []
+        for i in range(n):
+            if momentum[i] > 0:
+                direction.append(1)  # Bullish
+            elif momentum[i] < 0:
+                direction.append(-1)  # Bearish
+            else:
+                direction.append(0)  # Neutral
+        
+        return squeeze_on, momentum, direction
+    
+    @staticmethod
+    def is_squeeze_fired(squeeze_on: List[bool], lookback: int = 3) -> bool:
+        """
+        Check if the squeeze has just fired (released).
+        
+        A squeeze fires when it goes from ON to OFF, indicating
+        volatility expansion and potential breakout.
+        
+        Args:
+            squeeze_on: List of squeeze states
+            lookback: Number of bars to look back for squeeze-on state
+        
+        Returns:
+            True if squeeze just fired (was on, now off)
+        """
+        if len(squeeze_on) < lookback + 1:
+            return False
+        
+        # Current bar should have squeeze OFF
+        if squeeze_on[-1]:
+            return False
+        
+        # At least one of the recent bars should have had squeeze ON
+        for i in range(2, lookback + 2):
+            if len(squeeze_on) >= i and squeeze_on[-i]:
+                return True
+        
+        return False
+    
+    @staticmethod
+    def is_momentum_rising(momentum: List[float], lookback: int = 3) -> bool:
+        """
+        Check if momentum is rising (bars getting taller in same direction).
+        
+        Args:
+            momentum: List of momentum values
+            lookback: Number of bars to compare
+        
+        Returns:
+            True if momentum is increasing in magnitude
+        """
+        if len(momentum) < lookback + 1:
+            return False
+        
+        recent = momentum[-lookback-1:]
+        
+        # Check if all recent values have same sign
+        if all(m > 0 for m in recent) or all(m < 0 for m in recent):
+            # Check if magnitude is increasing
+            magnitudes = [abs(m) for m in recent]
+            return magnitudes[-1] > magnitudes[0]
+        
+        return False
+    
     @classmethod
     def calculate_all(
         cls,
@@ -340,6 +545,23 @@ class TechnicalIndicators:
         adx, plus_di, minus_di = cls.calculate_adx(highs, lows, closes)
         volume_sma = cls.calculate_sma(volumes, 20)
         
+        # Calculate TTM Squeeze
+        # Using parameters from your chart: TTM_Squeeze(CLOSE, 20, 1.5, 2.0, 1.0)
+        # bb_period=20, bb_mult=2.0, kc_period=20, kc_mult=1.5
+        squeeze_on_list, squeeze_momentum, squeeze_direction = cls.calculate_ttm_squeeze(
+            highs, lows, closes,
+            bb_period=getattr(config, 'TTM_BB_PERIOD', 20),
+            bb_mult=getattr(config, 'TTM_BB_MULT', 2.0),
+            kc_period=getattr(config, 'TTM_KC_PERIOD', 20),
+            kc_mult=getattr(config, 'TTM_KC_MULT', 1.5)
+        )
+        
+        # Determine if squeeze just fired
+        squeeze_fired = cls.is_squeeze_fired(squeeze_on_list)
+        
+        # Check if momentum is rising
+        momentum_rising = cls.is_momentum_rising(squeeze_momentum)
+        
         # Return latest values
         return IndicatorValues(
             ema_fast=ema_fast[-1] if ema_fast else 0.0,
@@ -359,5 +581,11 @@ class TechnicalIndicators:
             plus_di=plus_di[-1] if plus_di else 0.0,
             minus_di=minus_di[-1] if minus_di else 0.0,
             volume_sma=volume_sma[-1] if volume_sma else 0.0,
-            current_volume=volumes[-1] if volumes else 0.0
+            current_volume=volumes[-1] if volumes else 0.0,
+            # TTM Squeeze values
+            squeeze_on=squeeze_on_list[-1] if squeeze_on_list else False,
+            squeeze_fired=squeeze_fired,
+            squeeze_momentum=squeeze_momentum[-1] if squeeze_momentum else 0.0,
+            squeeze_momentum_rising=momentum_rising,
+            squeeze_direction=squeeze_direction[-1] if squeeze_direction else 0
         )

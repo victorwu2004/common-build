@@ -48,14 +48,21 @@ class TradingConfig:
     TRADING_END_MINUTE: int = 0
     USE_RTH_ONLY: bool = False  # Set True to trade only Regular Trading Hours
     
-    # Technical indicators
-    EMA_FAST: int = 9
+    # Technical indicators - EMA Crossover
+    EMA_FAST: int = 8   # Changed to 8 to match your chart
     EMA_SLOW: int = 21
     RSI_PERIOD: int = 14
     RSI_OVERBOUGHT: float = 70.0
     RSI_OVERSOLD: float = 30.0
     ATR_PERIOD: int = 14
     VWAP_ENABLED: bool = True
+    
+    # TTM Squeeze parameters (from your chart: TTM_Squeeze(CLOSE, 20, 1.5, 2.0, 1.0))
+    TTM_BB_PERIOD: int = 20       # Bollinger Bands period
+    TTM_BB_MULT: float = 2.0      # Bollinger Bands std dev multiplier
+    TTM_KC_PERIOD: int = 20       # Keltner Channel period
+    TTM_KC_MULT: float = 1.5      # Keltner Channel ATR multiplier
+    TTM_SQUEEZE_REQUIRED: bool = True  # Require squeeze fire for entry
     
     # Bar settings
     BAR_SIZE: str = "5 mins"  # IB bar size string
