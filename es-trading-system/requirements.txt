@@ -1,0 +1,20 @@
+# ES Dual Agent Trading System - Requirements
+
+# HTTP client
+requests>=2.31.0
+
+# Numeric operations
+numpy>=1.24.0
+
+# Timezone handling
+pytz>=2023.3
+
+# Optional: For backtesting
+pandas>=2.0.0
+
+# Optional: For visualization
+# matplotlib>=3.7.0
+
+# Optional: For async operations
+# aiohttp>=3.8.0
+# asyncio>=3.4.3
