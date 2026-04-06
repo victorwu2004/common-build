@@ -49,7 +49,7 @@ class TradingConfig:
     L2_STOP_LOSS_PCT: float = 1.0
     L2_TAKE_PROFIT_PCT: float = 2.0
     
-    MAX_DAILY_LOSS: float = 5000.0
+    MAX_DAILY_LOSS: float = 2000.0
     MAX_DAILY_TRADES: int = 10
     MAX_POSITION_VALUE: float = 200000.0
     
