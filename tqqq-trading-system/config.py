@@ -17,8 +17,9 @@ class TradingConfig:
     API_SECRET: str = os.getenv("TS_API_SECRET", "")
     REFRESH_TOKEN: str = os.getenv("TS_REFRESH_TOKEN", "")
     ACCOUNT_ID: str = os.getenv("TS_ACCOUNT_ID", "")
-    
-    BASE_URL: str = "https://api.tradestation.com/v3"
+    # EnvironmentBase URL     Live https://api.tradestation.com/v3
+    # SIM     (Paper)https://sim-api.tradestation.com/v3
+    BASE_URL: str = "https://sim-api.tradestation.com/v3"
     AUTH_URL: str = "https://signin.tradestation.com/oauth/token"
     
     # Symbol
