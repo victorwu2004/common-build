@@ -1,0 +1,226 @@
+// ============================================================
+// NQ EMA Crossover Strategy — Consolidated v2
+// Instrument : NQM26 (E-Mini NASDAQ-100 Futures)
+// Timeframe  : 5-Minute
+// Author     : Victor
+// Updated    : April 2026
+//
+// Fixes applied:
+//   1. Exit confirmation (2-bar) — reduces false exits
+//   2. Regime filter             — no shorts into uptrend
+//   3. EMA slope filter          — entries in trend direction only
+//   4. Staged reentry sizing     — momentum-based contract scaling
+// ============================================================
+
+// ─────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────
+inputs:
+    // EMA periods
+    FastLen         (8),        // Fast EMA period
+    SlowLen         (21),       // Slow EMA period
+
+    // Regime & slope
+    RegimeLookback  (10),       // Bars back for regime detection
+    SlopeLookback   (3),        // Bars back for EMA slope
+
+    // Exit confirmation
+    ExitBarsRequired(2),        // Consecutive bars below slow EMA to confirm exit
+
+    // Position sizing
+    BaseContracts   (2),        // Default contract size
+    MaxContracts    (4),        // Max contracts in strong trend
+
+    // Stop loss
+    StopTicks       (60),       // Hard stop in ticks (60 ticks = 30 pts on NQ)
+    TrailTicks      (80),       // Trailing stop in ticks once in profit
+
+    // Filters
+    UseSlopeFilter  (true),     // Require EMA slope alignment on entry
+    UseRegimeFilter (true),     // Enable regime-aware exit logic
+    UseMomentumSize (true);     // Enable momentum-based contract sizing
+
+
+// ─────────────────────────────────────────────
+// VARIABLES
+// ─────────────────────────────────────────────
+variables:
+    FastEMA         (0),
+    SlowEMA         (0),
+    EMASlope        (0),        // Slope of slow EMA over SlopeLookback bars
+    Regime          (0),        // 1=uptrend, -1=downtrend, 0=neutral
+    ExitBarCount    (0),        // Consecutive bars fast < slow
+    MomentumOK      (false),    // Price moving in entry direction
+    EntrySize       (0),        // Contracts to buy on this signal
+    InTrade         (false);    // Are we currently in a position
+
+
+// ─────────────────────────────────────────────
+// INDICATOR CALCULATIONS
+// ─────────────────────────────────────────────
+
+// EMA values
+FastEMA = XAverage(Close, FastLen);
+SlowEMA = XAverage(Close, SlowLen);
+
+// Slow EMA slope — positive means rising, negative means falling
+EMASlope = SlowEMA - SlowEMA[SlopeLookback];
+
+// Regime detection — based on slow EMA direction over RegimeLookback bars
+if SlowEMA > SlowEMA[RegimeLookback] then
+    Regime = 1          // Uptrend
+else if SlowEMA < SlowEMA[RegimeLookback] then
+    Regime = -1         // Downtrend
+else
+    Regime = 0;         // Neutral / sideways
+
+// Exit confirmation counter
+// Increments each bar fast EMA stays below slow EMA
+// Resets the moment fast EMA is back above
+if FastEMA < SlowEMA then
+    ExitBarCount = ExitBarCount + 1
+else
+    ExitBarCount = 0;
+
+// Momentum confirmation
+// True when price is closing up over last 2 bars and bar is bullish
+MomentumOK = Close > Close[2] and Close > Open;
+
+// Track position state
+InTrade = MarketPosition > 0;
+
+
+// ─────────────────────────────────────────────
+// ENTRY LOGIC — LONG ONLY
+// ─────────────────────────────────────────────
+
+// Base entry condition: fast EMA crosses above slow EMA
+if FastEMA crosses above SlowEMA then begin
+
+    // Slope filter: only enter if slow EMA is rising (trend aligned)
+    // Skip if slope filter enabled and EMA is still falling
+    if UseSlopeFilter = false or EMASlope > 0 then begin
+
+        // ── Staged sizing based on regime + momentum ──
+
+        if UseMomentumSize then begin
+
+            if Regime = 1 and MomentumOK then
+                // Strong uptrend + momentum confirmation = max size
+                EntrySize = MaxContracts
+
+            else if MomentumOK then
+                // Momentum present but trend not yet confirmed = base size
+                EntrySize = BaseContracts
+
+            else
+                // No momentum — skip entry this bar
+                EntrySize = 0;
+
+        end else begin
+            // Sizing disabled — always use base contracts
+            EntrySize = BaseContracts;
+        end;
+
+        // Fire entry if size is valid
+        if EntrySize > 0 then
+            Buy("L_EMAxUp") EntrySize contracts;
+
+    end; // slope filter
+end; // crossover
+
+
+// ─────────────────────────────────────────────
+// EXIT LOGIC
+// ─────────────────────────────────────────────
+
+if MarketPosition > 0 then begin
+
+    // ── Exit Confirmation: require N consecutive bars below slow EMA ──
+    // This prevents exiting on a single-bar dip / wick below
+
+    if ExitBarCount >= ExitBarsRequired then begin
+
+        if UseRegimeFilter then begin
+
+            // In an uptrend: treat crossdown as a pullback — exit only
+            // Do not reverse short; wait for next L_EMAxUp signal
+            if Regime = 1 then
+                Sell("LX_Pullback") all contracts
+
+            // In downtrend or neutral: full exit, consider reversal
+            else
+                Sell("LX_EMAxDn") all contracts;
+
+        end else begin
+            // Regime filter off — always exit on confirmation
+            Sell("LX_EMAxDn") all contracts;
+        end;
+
+    end; // ExitBarCount
+
+end; // MarketPosition > 0
+
+
+// ─────────────────────────────────────────────
+// STOP LOSS — Hard Stop + Trailing Stop
+// ─────────────────────────────────────────────
+
+// Hard stop — always on, protects against gap/crash scenarios
+// StopTicks = 60 → 15 points on NQ (1 point = 4 ticks)
+SetStopLoss(StopTicks * MinMove / PriceScale);
+
+// Trailing stop — kicks in once trade is moving in your favor
+// TrailTicks = 80 → 20 points trail
+SetDollarTrailing(TrailTicks * MinMove / PriceScale);
+
+
+// ─────────────────────────────────────────────
+// PLOTS — for chart visualization
+// ─────────────────────────────────────────────
+
+Plot1(FastEMA, "FastEMA",  Cyan);
+Plot2(SlowEMA, "SlowEMA",  Red);
+
+// Regime background shading (optional — comment out if too noisy)
+if Regime = 1 then
+    Plot3(Low - 10, "UpRegime", DarkGreen)
+else if Regime = -1 then
+    Plot3(Low - 10, "DnRegime", DarkRed)
+else
+    Plot3(Low - 10, "Neutral",  Gray);
+
+
+// ─────────────────────────────────────────────
+// STRATEGY NOTES
+// ─────────────────────────────────────────────
+//
+//  ENTRY RULES (all must be true):
+//  1. FastEMA crosses above SlowEMA
+//  2. EMASlope > 0 (if UseSlopeFilter = true)
+//  3. MomentumOK = true (if UseMomentumSize = true)
+//
+//  EXIT RULES:
+//  1. FastEMA has been below SlowEMA for >= ExitBarsRequired bars
+//  2. If Regime=1 (uptrend): exit only (LX_Pullback), no short flip
+//  3. If Regime<>1: full exit (LX_EMAxDn)
+//
+//  SIZING RULES:
+//  - Regime=1 + MomentumOK  → MaxContracts (4)
+//  - MomentumOK only         → BaseContracts (2)
+//  - No momentum             → Skip entry
+//
+//  STOPS:
+//  - Hard stop : StopTicks (60) = 15 NQ points
+//  - Trail stop: TrailTicks (80) = 20 NQ points
+//
+//  RECOMMENDED OPTIMIZATION RANGES:
+//  FastLen          : 5 to 13, step 1
+//  SlowLen          : 15 to 30, step 1
+//  ExitBarsRequired : 1 to 4,  step 1
+//  SlopeLookback    : 2 to 6,  step 1
+//  RegimeLookback   : 7 to 15, step 1
+//  StopTicks        : 40 to 100, step 10
+//  TrailTicks       : 60 to 120, step 10
+//
+// ============================================================
