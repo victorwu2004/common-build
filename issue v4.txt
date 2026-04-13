@@ -1,0 +1,18 @@
+## What changed
+
+Added the `Authenticate gh CLI` step as the **second step** (right after the skip check, before everything else):
+
+```bash
+echo "$GH_TOKEN" | gh auth login --with-token
+gh auth status
+```
+
+**Step order is now:**
+1. Skip if not production
+2. **Authenticate gh CLI** ← new
+3. Validate inputs
+4. Ensure approval labels exist
+5. Create RDM approval issue
+6. Wait for RDM approval
+
+**Why `gh auth login` is needed in composite actions** — when `GH_TOKEN` is set in a regular job step, the runner injects it automatically into the `gh` CLI environment. But inside a composite action, that automatic injection is unreliable — the token is scoped to the action's input context, not the runner's ambient environment. Explicitly piping the token via `--with-token` guarantees authentication regardless of runner type.
