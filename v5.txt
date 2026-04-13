@@ -1,0 +1,27 @@
+That error means `gh auth login` is running in interactive mode instead of non-interactive. The `--with-token` flag requires stdin to be properly piped — on some runners the pipe isn't working and it falls back to interactive browser flow.
+
+## Fix — use `gh auth login` with explicit flags to force non-interactive
+
+```bash
+echo "$GH_TOKEN" | gh auth login --with-token --hostname github.com --git-protocol https
+```
+
+But the **most reliable fix** for CI is to skip `gh auth login` entirely and just set `GH_TOKEN` as an environment variable — that's the officially recommended approach for non-interactive CI use:
+
+## What changed
+
+**Removed `gh auth login --with-token`** — that command is designed for interactive terminal use. In CI it triggers device/browser flow if stdin isn't a proper pipe, which is exactly what you saw.
+
+**Replaced with `gh auth status`** — the `gh` CLI automatically picks up `GH_TOKEN` from the environment without any login command. `gh auth status` just verifies the token is valid and readable:
+
+```bash
+# ❌ Causes browser/device flow in CI
+echo "$GH_TOKEN" | gh auth login --with-token
+
+# ✅ Correct CI pattern — GH_TOKEN env var is enough
+env:
+  GH_TOKEN: ${{ inputs.github-token }}
+run: gh auth status   # just verifies, no login needed
+```
+
+Every step already has `GH_TOKEN` in its `env:` block — that's all the `gh` CLI needs. The key is that `GH_TOKEN` must be set at the **step level `env:`**, not inherited — which is already the pattern used throughout this action.
