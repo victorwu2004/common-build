@@ -1,0 +1,300 @@
+name: 'RDM Production Deployment Approval'
+description: 'Creates a GitHub issue in the RDM repo for production deployment approval and waits for closure with approved/rejected label'
+
+inputs:
+  is-production:
+    description: 'Whether this is a production deployment (true/false)'
+    required: true
+    default: 'false'
+  github-token:
+    description: 'PAT with repo scope on the RDM repo (issues:write, labels:write)'
+    required: true
+  rdm-repo:
+    description: 'RDM repo slug — format: orgname/reponame (no https://, no github.com)'
+    required: true
+  app-name:
+    description: 'Application name requesting deployment'
+    required: true
+  deploy-env:
+    description: 'Target deployment environment e.g. PROD'
+    required: true
+  caller-repo:
+    description: 'Calling repository slug (auto-populated)'
+    required: false
+    default: ${{ github.repository }}
+  caller-run-id:
+    description: 'Calling workflow run ID (auto-populated)'
+    required: false
+    default: ${{ github.run_id }}
+  poll-interval-seconds:
+    description: 'How often to poll issue status in seconds'
+    required: false
+    default: '60'
+  max-wait-minutes:
+    description: 'Maximum wait time in minutes — GitHub job hard limit is 360'
+    required: false
+    default: '360'
+  approved-label:
+    description: 'Label name that indicates approval'
+    required: false
+    default: 'approved'
+  rejected-label:
+    description: 'Label name that indicates rejection'
+    required: false
+    default: 'rejected'
+
+outputs:
+  approved:
+    description: 'Whether deployment was approved — true or false'
+    value: ${{ steps.wait-approval.outputs.approved }}
+  issue-number:
+    description: 'The created issue number'
+    value: ${{ steps.create-issue.outputs.issue-number }}
+  issue-url:
+    description: 'The created issue URL'
+    value: ${{ steps.create-issue.outputs.issue-url }}
+
+runs:
+  using: composite
+  steps:
+
+    # ── Skip entirely if not production ──────────────────────────────────────
+    - name: Skip if not production
+      if: inputs.is-production != 'true'
+      shell: bash
+      run: |
+        echo "ℹ️ Not a production deployment — skipping RDM approval gate."
+        echo "approved=true" >> "$GITHUB_OUTPUT"
+
+    # ── Verify gh CLI authentication ──────────────────────────────────────────
+    # GH_TOKEN env var is all gh CLI needs in CI — no gh auth login required.
+    - name: Verify gh CLI authentication
+      if: inputs.is-production == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        echo "🔐 Verifying gh CLI authentication..."
+        if ! gh auth status --hostname github.com 2>&1; then
+          echo "❌ gh CLI cannot authenticate — check that github-token is a valid PAT with 'repo' scope."
+          exit 1
+        fi
+        echo "✅ gh CLI authenticated."
+
+    # ── Validate rdm-repo format ──────────────────────────────────────────────
+    # Only validates the format — repo access is confirmed implicitly when
+    # gh issue create runs. A separate gh repo view check is unnecessary
+    # and adds a permission surface that may differ from issue create scope.
+    - name: Validate rdm-repo format
+      if: inputs.is-production == 'true'
+      shell: bash
+      env:
+        RDM_REPO: ${{ inputs.rdm-repo }}
+      run: |
+        echo "🔍 Validating rdm-repo format: '$RDM_REPO'"
+
+        # Must be exactly org/repo — no URL, no hostname, no trailing slash
+        if [[ ! "$RDM_REPO" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
+          echo "❌ Invalid rdm-repo format: '$RDM_REPO'"
+          echo "   Expected : orgname/reponame"
+          echo "   Example  : myorgname/rdm-approvals"
+          echo "   Do NOT include https://, github.com, or trailing slashes."
+          exit 1
+        fi
+
+        echo "✅ Format valid: $RDM_REPO"
+
+    # ── Ensure required labels exist in RDM repo ─────────────────────────────
+    - name: Ensure approval labels exist
+      if: inputs.is-production == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        RDM_REPO: ${{ inputs.rdm-repo }}
+        APPROVED_LABEL: ${{ inputs.approved-label }}
+        REJECTED_LABEL: ${{ inputs.rejected-label }}
+      run: |
+        echo "🏷️ Ensuring labels exist in $RDM_REPO..."
+
+        gh label create "$APPROVED_LABEL" \
+          --repo "$RDM_REPO" \
+          --color "0e8a16" \
+          --description "Deployment approved by RDM team" \
+          --force
+
+        gh label create "$REJECTED_LABEL" \
+          --repo "$RDM_REPO" \
+          --color "d73a4a" \
+          --description "Deployment rejected by RDM team" \
+          --force
+
+        gh label create "pending-approval" \
+          --repo "$RDM_REPO" \
+          --color "e4e669" \
+          --description "Awaiting RDM team approval" \
+          --force
+
+        echo "✅ Labels ready."
+
+    # ── Create the approval issue ─────────────────────────────────────────────
+    - name: Create RDM approval issue
+      if: inputs.is-production == 'true'
+      id: create-issue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        RDM_REPO: ${{ inputs.rdm-repo }}
+        APP_NAME: ${{ inputs.app-name }}
+        DEPLOY_ENV: ${{ inputs.deploy-env }}
+        CALLER_REPO: ${{ inputs.caller-repo }}
+        CALLER_RUN_ID: ${{ inputs.caller-run-id }}
+        APPROVED_LABEL: ${{ inputs.approved-label }}
+        REJECTED_LABEL: ${{ inputs.rejected-label }}
+        ACTOR: ${{ github.actor }}
+        REF: ${{ github.ref }}
+        SHA: ${{ github.sha }}
+      run: |
+        echo "📋 Creating RDM approval issue in $RDM_REPO..."
+
+        RUN_URL="https://github.com/$CALLER_REPO/actions/runs/$CALLER_RUN_ID"
+        CREATED_AT=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+        SHORT_SHA="${SHA:0:7}"
+
+        BODY_FILE=$(mktemp /tmp/rdm-issue-body.XXXXXX)
+        cat > "$BODY_FILE" <<EOF
+## 🚀 Production Deployment Approval Required
+
+| Field | Value |
+|-------|-------|
+| **Application** | \`$APP_NAME\` |
+| **Environment** | \`$DEPLOY_ENV\` |
+| **Repository** | \`$CALLER_REPO\` |
+| **Workflow Run** | [$CALLER_RUN_ID]($RUN_URL) |
+| **Requested At** | $CREATED_AT |
+| **Requested By** | @$ACTOR |
+| **Branch / Ref** | \`$REF\` |
+| **Commit** | \`$SHORT_SHA\` |
+
+## ✅ How to Approve
+
+1. Review the workflow run linked above
+2. Add the \`$APPROVED_LABEL\` label to this issue
+3. Close the issue
+
+## ❌ How to Reject
+
+1. Add the \`$REJECTED_LABEL\` label to this issue
+2. Close the issue
+
+---
+> ⚠️ **The deployment pipeline is paused** waiting for this issue to be closed.
+> Closing **without** a label will cause the pipeline to fail automatically.
+EOF
+
+        ISSUE_URL=$(gh issue create \
+          --repo "$RDM_REPO" \
+          --title "🚀 Deployment Approval: $APP_NAME → $DEPLOY_ENV" \
+          --body-file "$BODY_FILE" \
+          --label "pending-approval")
+
+        rm -f "$BODY_FILE"
+
+        if [[ -z "$ISSUE_URL" ]]; then
+          echo "❌ Failed to create issue — gh returned empty URL"
+          exit 1
+        fi
+
+        ISSUE_NUMBER="${ISSUE_URL##*/}"
+
+        if [[ -z "$ISSUE_NUMBER" || ! "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
+          echo "❌ Could not parse issue number from URL: $ISSUE_URL"
+          exit 1
+        fi
+
+        echo "✅ Issue created: #$ISSUE_NUMBER"
+        echo "   URL: $ISSUE_URL"
+        echo "issue-number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+        echo "issue-url=$ISSUE_URL"       >> "$GITHUB_OUTPUT"
+
+    # ── Poll until closed or timeout ──────────────────────────────────────────
+    - name: Wait for RDM approval
+      if: inputs.is-production == 'true'
+      id: wait-approval
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        RDM_REPO: ${{ inputs.rdm-repo }}
+        ISSUE_NUMBER: ${{ steps.create-issue.outputs.issue-number }}
+        ISSUE_URL: ${{ steps.create-issue.outputs.issue-url }}
+        POLL_INTERVAL: ${{ inputs.poll-interval-seconds }}
+        MAX_WAIT_MINUTES: ${{ inputs.max-wait-minutes }}
+        APPROVED_LABEL: ${{ inputs.approved-label }}
+        REJECTED_LABEL: ${{ inputs.rejected-label }}
+      run: |
+        echo "⏳ Waiting for RDM approval on issue #$ISSUE_NUMBER"
+        echo "   Issue URL     : $ISSUE_URL"
+        echo "   Poll interval : ${POLL_INTERVAL}s"
+        echo "   Max wait      : ${MAX_WAIT_MINUTES} minutes"
+        echo ""
+
+        MAX_SECONDS=$(( MAX_WAIT_MINUTES * 60 ))
+        ELAPSED=0
+        APPROVED="false"
+        DECISION_MADE="false"
+
+        while [[ $ELAPSED -lt $MAX_SECONDS ]]; do
+
+          ISSUE_JSON=$(gh issue view "$ISSUE_NUMBER" \
+            --repo "$RDM_REPO" \
+            --json state,labels)
+
+          STATE=$(echo "$ISSUE_JSON"  | jq -r '.state')
+          LABELS=$(echo "$ISSUE_JSON" | jq -r '[.labels[].name] | join(",")')
+
+          REMAINING_MIN=$(( (MAX_SECONDS - ELAPSED) / 60 ))
+          echo "⏱️  [${ELAPSED}s elapsed | ~${REMAINING_MIN}m remaining] state=$STATE labels=${LABELS:-none}"
+
+          if [[ "${STATE^^}" == "CLOSED" ]]; then
+            echo ""
+            echo "🔒 Issue closed — evaluating labels..."
+
+            if echo "$LABELS" | grep -qi "$APPROVED_LABEL"; then
+              echo "✅ Deployment APPROVED by RDM team."
+              APPROVED="true"
+              DECISION_MADE="true"
+              break
+            elif echo "$LABELS" | grep -qi "$REJECTED_LABEL"; then
+              echo "❌ Deployment REJECTED by RDM team."
+              DECISION_MADE="true"
+              break
+            else
+              echo "⚠️ Closed with no approval or rejection label — treating as rejected."
+              DECISION_MADE="true"
+              break
+            fi
+          fi
+
+          sleep "$POLL_INTERVAL"
+          ELAPSED=$(( ELAPSED + POLL_INTERVAL ))
+        done
+
+        # ── Timeout ───────────────────────────────────────────────────────────
+        if [[ "$DECISION_MADE" == "false" ]]; then
+          echo ""
+          echo "⏰ Timed out after ${MAX_WAIT_MINUTES} minutes — no decision received."
+
+          gh issue comment "$ISSUE_NUMBER" \
+            --repo "$RDM_REPO" \
+            --body "⏰ **Pipeline timed out** after waiting ${MAX_WAIT_MINUTES} minutes for approval. The deployment has been automatically cancelled."
+
+          echo "approved=false" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        echo "approved=$APPROVED" >> "$GITHUB_OUTPUT"
+
+        if [[ "$APPROVED" != "true" ]]; then
+          echo ""
+          echo "🚫 Deployment blocked — pipeline will fail."
+          exit 1
+        fi
