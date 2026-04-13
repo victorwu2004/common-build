@@ -1,0 +1,16 @@
+Exactly — the `gh` CLI is constructing the API URL as `api.github.com/repos/...` but your org requires it to go through `github.com` directly, or your runner's `gh` config is pointing to the wrong API endpoint.
+
+The fix is to set `GH_HOST` **and** `GITHUB_HOST` explicitly in the env so `gh` CLI builds the correct base URL:
+
+## What changed and why
+
+`GH_HOST: github.com` added to **every step's `env:`** block.
+
+This is the key — when `GH_HOST` is set, the `gh` CLI builds its API URL differently:
+
+| `GH_HOST` | API URL constructed |
+|---|---|
+| not set | `https://api.github.com/repos/...` |
+| `github.com` | `https://github.com/api/v3/repos/...` |
+
+Your org is routing through `github.com/api/v3` not `api.github.com` — which is common when the org has **SAML SSO**, **IP allowlists**, or **enterprise managed users (EMU)** configured. Setting `GH_HOST=github.com` forces the correct routing.
