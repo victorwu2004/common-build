@@ -1,0 +1,22 @@
+## What changed
+
+Every step now has all three env vars together:
+
+```yaml
+env:
+  GH_TOKEN: ${{ inputs.github-token }}
+  GH_HOST: github.com
+  GITHUB_API_URL: https://github.com/api/v3
+```
+
+## How these three work together
+
+| Env var | Controls | Effect |
+|---|---|---|
+| `GH_TOKEN` | Authentication | PAT passed to every `gh` call |
+| `GH_HOST` | Host resolution | Tells `gh` which GitHub instance to target |
+| `GITHUB_API_URL` | API endpoint | Overrides `api.github.com` → `github.com/api/v3` |
+
+`GITHUB_API_URL` is the critical one — it's the exact env var the `gh` CLI reads to construct REST API call URLs. Without it, `gh` always defaults to `https://api.github.com` regardless of `GH_HOST`.
+
+If this still fails, the next thing to check with your network team is whether `github.com/api/v3` is explicitly allowed through the proxy/firewall, since some corporate firewalls allow `github.com` for web traffic but still block API path patterns.
