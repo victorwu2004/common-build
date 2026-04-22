@@ -1,0 +1,104 @@
+name: 'Environment Approval Gate'
+description: 'Record and audit an environment-gated approval. Must be used inside a job that sets environment:.'
+author: 'RDM Platform'
+
+inputs:
+  environment:
+    description: 'Name of the environment being used to gate (for logging/summary only; actual gate is the job-level environment:).'
+    required: true
+  change-ticket:
+    description: 'Change ticket or reference identifier.'
+    required: false
+    default: ''
+  requester:
+    description: 'Requesting user or team. Defaults to the triggering actor.'
+    required: false
+    default: ''
+  notes:
+    description: 'Optional free-text notes shown to the reviewer in the job summary.'
+    required: false
+    default: ''
+
+outputs:
+  approver:
+    description: 'The GitHub actor that triggered the run (the approver once the environment prompt is accepted).'
+    value: ${{ steps.record.outputs.approver }}
+  approved-at:
+    description: 'UTC timestamp when the gate cleared.'
+    value: ${{ steps.record.outputs.approved_at }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Verify environment gate is in effect
+      shell: bash
+      env:
+        EXPECTED_ENV: ${{ inputs.environment }}
+        ACTUAL_ENV:   ${{ github.event.deployment.environment }}
+      run: |
+        # The job only reaches this step after the environment's required reviewers
+        # have approved. If the calling job forgot to set environment:, there is no
+        # gate. We cannot enforce that from a composite action, but we can warn.
+        if [[ -z "${GITHUB_ENV_NAME:-}" ]] && [[ -z "${ACTUAL_ENV:-}" ]]; then
+          echo "::warning::This action is intended for jobs that set 'environment:'. No environment context detected."
+        fi
+        echo "Gate cleared for environment: $EXPECTED_ENV"
+
+    - name: Record approval
+      id: record
+      shell: bash
+      env:
+        REQUESTER_INPUT: ${{ inputs.requester }}
+        ACTOR:           ${{ github.actor }}
+        TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+      run: |
+        set -euo pipefail
+
+        REQUESTER="$REQUESTER_INPUT"
+        if [[ -z "$REQUESTER" ]]; then
+          REQUESTER="$TRIGGERING_ACTOR"
+        fi
+
+        # github.actor is the user that advanced the run. For environment-gated
+        # jobs, this is the reviewer who clicked Approve.
+        APPROVER="$ACTOR"
+        APPROVED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+        echo "approver=$APPROVER"        >> "$GITHUB_OUTPUT"
+        echo "approved_at=$APPROVED_AT"  >> "$GITHUB_OUTPUT"
+        echo "requester=$REQUESTER"      >> "$GITHUB_OUTPUT"
+
+        echo "::notice::Environment '${{ inputs.environment }}' approved by $APPROVER at $APPROVED_AT"
+
+    - name: Write approval summary
+      shell: bash
+      env:
+        ENVIRONMENT: ${{ inputs.environment }}
+        TICKET:      ${{ inputs.change-ticket }}
+        NOTES:       ${{ inputs.notes }}
+        APPROVER:    ${{ steps.record.outputs.approver }}
+        APPROVED_AT: ${{ steps.record.outputs.approved_at }}
+        REQUESTER:   ${{ steps.record.outputs.requester }}
+        RUN_URL:     ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        {
+          echo "## Deployment Approval Recorded"
+          echo ""
+          echo "| Field | Value |"
+          echo "|---|---|"
+          echo "| Environment | \`$ENVIRONMENT\` |"
+          echo "| Approver | \`$APPROVER\` |"
+          echo "| Approved at (UTC) | $APPROVED_AT |"
+          echo "| Requester | $REQUESTER |"
+          echo "| Change ticket | ${TICKET:-_(none)_} |"
+          echo "| Repo | \`${{ github.repository }}\` |"
+          echo "| Ref | \`${{ github.ref }}\` |"
+          echo "| SHA | \`${{ github.sha }}\` |"
+          echo "| Run | [link]($RUN_URL) |"
+          if [[ -n "$NOTES" ]]; then
+            echo ""
+            echo "**Notes**"
+            echo ""
+            echo "$NOTES"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"

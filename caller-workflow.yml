@@ -1,0 +1,43 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      change_ticket:
+        description: 'CHG ticket number'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./build.sh
+
+  approve-and-deploy:
+    needs: build
+    runs-on: self-hosted
+    # The environment: block is the actual gate. GitHub blocks this job from
+    # starting until a required reviewer approves in Settings -> Environments.
+    environment:
+      name: production
+      url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      # Runs after the reviewer clicks Approve. Records who approved and when.
+      - name: Record approval
+        id: approval
+        uses: my-org/caller-env-approval@v1
+        with:
+          environment: production
+          change-ticket: ${{ inputs.change_ticket }}
+          notes: |
+            Deploying ${{ github.ref_name }} @ ${{ github.sha }}
+            Triggered by ${{ github.triggering_actor }}
+
+      - uses: actions/checkout@v4
+
+      - name: Deploy
+        run: ./deploy.sh
+        env:
+          APPROVER: ${{ steps.approval.outputs.approver }}
+          APPROVED_AT: ${{ steps.approval.outputs.approved-at }}
