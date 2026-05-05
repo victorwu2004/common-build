@@ -1,104 +1,97 @@
-name: 'Environment Approval Gate'
-description: 'Record and audit an environment-gated approval. Must be used inside a job that sets environment:.'
-author: 'RDM Platform'
+name: 'Veracode Sandbox Scan'
+description: 'Resolves a free sandbox (or creates one) and runs a Veracode scan'
 
 inputs:
-  environment:
-    description: 'Name of the environment being used to gate (for logging/summary only; actual gate is the job-level environment:).'
+  veracode_api_id:
+    description: 'Veracode API ID (HMAC)'
     required: true
-  change-ticket:
-    description: 'Change ticket or reference identifier.'
+  veracode_api_key:
+    description: 'Veracode API key (HMAC)'
+    required: true
+  veracode_app_id:
+    description: 'Numeric Veracode application ID'
+    required: true
+  veracode_app_name:
+    description: 'Veracode application name (for uploadandscan)'
+    required: true
+  sandbox_name_prefix:
+    description: 'Prefix for newly-created sandboxes'
     required: false
-    default: ''
-  requester:
-    description: 'Requesting user or team. Defaults to the triggering actor.'
+    default: 'ci-'
+  artifact_path:
+    description: 'Path to artifact(s) to scan'
+    required: true
+  fail_on_policy_violation:
+    description: 'Fail the workflow if Veracode policy fails'
     required: false
-    default: ''
-  notes:
-    description: 'Optional free-text notes shown to the reviewer in the job summary.'
-    required: false
-    default: ''
+    default: 'true'
 
 outputs:
-  approver:
-    description: 'The GitHub actor that triggered the run (the approver once the environment prompt is accepted).'
-    value: ${{ steps.record.outputs.approver }}
-  approved-at:
-    description: 'UTC timestamp when the gate cleared.'
-    value: ${{ steps.record.outputs.approved_at }}
+  sandbox_id:
+    description: 'Resolved sandbox ID'
+    value: ${{ steps.resolve.outputs.sandbox_id }}
+  sandbox_name:
+    description: 'Resolved sandbox name'
+    value: ${{ steps.resolve.outputs.sandbox_name }}
+  created:
+    description: 'Whether the sandbox was newly created'
+    value: ${{ steps.resolve.outputs.created }}
+  scan_failed:
+    description: 'Whether the scan failed for non-policy reasons'
+    value: ${{ steps.scan.outputs.scan_failed }}
 
 runs:
   using: 'composite'
   steps:
-    - name: Verify environment gate is in effect
+
+    - name: Resolve sandbox (idle lookup or create)
+      id: resolve
       shell: bash
       env:
-        EXPECTED_ENV: ${{ inputs.environment }}
-        ACTUAL_ENV:   ${{ github.event.deployment.environment }}
+        # Inputs and secrets become env vars HERE -- not in CLI args.
+        # GitHub auto-masks values that came in via `secrets.*`, so anything
+        # the script echoes that contains the key gets ***'d in logs.
+        VERACODE_API_ID:     ${{ inputs.veracode_api_id }}
+        VERACODE_API_KEY:    ${{ inputs.veracode_api_key }}
+        VERACODE_APP_ID:     ${{ inputs.veracode_app_id }}
+        SANDBOX_NAME_PREFIX: ${{ inputs.sandbox_name_prefix }}
+        # GITHUB_RUN_ID is already in the env automatically -- no need to set it
       run: |
-        # The job only reaches this step after the environment's required reviewers
-        # have approved. If the calling job forgot to set environment:, there is no
-        # gate. We cannot enforce that from a composite action, but we can warn.
-        if [[ -z "${GITHUB_ENV_NAME:-}" ]] && [[ -z "${ACTUAL_ENV:-}" ]]; then
-          echo "::warning::This action is intended for jobs that set 'environment:'. No environment context detected."
-        fi
-        echo "Gate cleared for environment: $EXPECTED_ENV"
+        # Action's own files live under $GITHUB_ACTION_PATH
+        bash "$GITHUB_ACTION_PATH/scripts/veracode-sandbox-resolve.sh"
 
-    - name: Record approval
-      id: record
+    - name: Wait and retry if all sandboxes busy
+      if: steps.resolve.outputs.all_busy == 'true'
       shell: bash
       env:
-        REQUESTER_INPUT: ${{ inputs.requester }}
-        ACTOR:           ${{ github.actor }}
-        TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        VERACODE_API_ID:     ${{ inputs.veracode_api_id }}
+        VERACODE_API_KEY:    ${{ inputs.veracode_api_key }}
+        VERACODE_APP_ID:     ${{ inputs.veracode_app_id }}
+        SANDBOX_NAME_PREFIX: ${{ inputs.sandbox_name_prefix }}
       run: |
-        set -euo pipefail
+        echo "::notice::All sandboxes busy, waiting 5min before retry"
+        sleep 300
+        bash "$GITHUB_ACTION_PATH/scripts/veracode-sandbox-resolve.sh"
 
-        REQUESTER="$REQUESTER_INPUT"
-        if [[ -z "$REQUESTER" ]]; then
-          REQUESTER="$TRIGGERING_ACTOR"
-        fi
+    - name: Mask derived sandbox ID (optional)
+      shell: bash
+      run: |
+        # Sandbox IDs aren't secret, but if you want them out of logs:
+        # echo "::add-mask::${{ steps.resolve.outputs.sandbox_id }}"
+        echo "Resolved: id=${{ steps.resolve.outputs.sandbox_id }} \
+              name=${{ steps.resolve.outputs.sandbox_name }} \
+              created=${{ steps.resolve.outputs.created }}"
 
-        # github.actor is the user that advanced the run. For environment-gated
-        # jobs, this is the reviewer who clicked Approve.
-        APPROVER="$ACTOR"
-        APPROVED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-        echo "approver=$APPROVER"        >> "$GITHUB_OUTPUT"
-        echo "approved_at=$APPROVED_AT"  >> "$GITHUB_OUTPUT"
-        echo "requester=$REQUESTER"      >> "$GITHUB_OUTPUT"
-
-        echo "::notice::Environment '${{ inputs.environment }}' approved by $APPROVER at $APPROVED_AT"
-
-    - name: Write approval summary
+    - name: Run Veracode scan
+      id: scan
       shell: bash
       env:
-        ENVIRONMENT: ${{ inputs.environment }}
-        TICKET:      ${{ inputs.change-ticket }}
-        NOTES:       ${{ inputs.notes }}
-        APPROVER:    ${{ steps.record.outputs.approver }}
-        APPROVED_AT: ${{ steps.record.outputs.approved_at }}
-        REQUESTER:   ${{ steps.record.outputs.requester }}
-        RUN_URL:     ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        VERACODE_API_ID:    ${{ inputs.veracode_api_id }}
+        VERACODE_API_KEY:   ${{ inputs.veracode_api_key }}
+        VERACODE_APP_NAME:  ${{ inputs.veracode_app_name }}
+        SANDBOX_ID:         ${{ steps.resolve.outputs.sandbox_id }}
+        SANDBOX_NAME:       ${{ steps.resolve.outputs.sandbox_name }}
+        ARTIFACT_PATH:      ${{ inputs.artifact_path }}
+        FAIL_ON_POLICY:     ${{ inputs.fail_on_policy_violation }}
       run: |
-        {
-          echo "## Deployment Approval Recorded"
-          echo ""
-          echo "| Field | Value |"
-          echo "|---|---|"
-          echo "| Environment | \`$ENVIRONMENT\` |"
-          echo "| Approver | \`$APPROVER\` |"
-          echo "| Approved at (UTC) | $APPROVED_AT |"
-          echo "| Requester | $REQUESTER |"
-          echo "| Change ticket | ${TICKET:-_(none)_} |"
-          echo "| Repo | \`${{ github.repository }}\` |"
-          echo "| Ref | \`${{ github.ref }}\` |"
-          echo "| SHA | \`${{ github.sha }}\` |"
-          echo "| Run | [link]($RUN_URL) |"
-          if [[ -n "$NOTES" ]]; then
-            echo ""
-            echo "**Notes**"
-            echo ""
-            echo "$NOTES"
-          fi
-        } >> "$GITHUB_STEP_SUMMARY"
+        bash "$GITHUB_ACTION_PATH/scripts/veracode-scan.sh"

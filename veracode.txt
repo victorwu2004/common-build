@@ -1,3 +1,48 @@
+Good question — this is a recurring pattern in your composite action work. The clean way is to pass them as **environment variables in the step that runs the script**, not as CLI args (secrets in args leak into process listings and logs).
+
+Here's the composite action wiring:
+
+Now the script side — read from env, never from args:
+
+**The five rules at play:**
+
+**1. `env:` block on the step, not the whole action.** Only the step that needs the secret gets it. The "Mask derived sandbox ID" step doesn't have `VERACODE_API_KEY` in its env — least privilege.
+
+**2. `inputs.*` for non-secrets, `secrets.*` for sensitive values.** The caller workflow does the wiring:
+
+```yaml
+- uses: ./.github/actions/veracode-sandbox-scan
+  with:
+    veracode_api_id:   ${{ secrets.VERACODE_API_ID }}
+    veracode_api_key:  ${{ secrets.VERACODE_API_KEY }}
+    veracode_app_id:   ${{ vars.VERACODE_APP_ID }}
+    veracode_app_name: ${{ vars.VERACODE_APP_NAME }}
+    artifact_path:     ./build/output.jar
+```
+
+GitHub auto-masks anything that originated as `${{ secrets.* }}`, so even if your script accidentally `echo`s the API key, it shows as `***` in logs. This is the same masking behavior you used for derived tokens in the GitHub App work.
+
+**3. Never `${{ inputs.veracode_api_key }}` inside `run:`.** Putting secrets in the script body causes them to be expanded into the rendered shell script before execution — they end up in `/home/runner/work/_temp/*.sh` on disk and in `set -x` traces. The `env:` block keeps them in the process environment only.
+
+**4. Use `$GITHUB_ACTION_PATH` to find your scripts.** Composite actions don't run from the caller's checkout — they run from wherever the action was resolved to. Hardcoding `./scripts/foo.sh` will fail because the working directory is the *caller's* repo. `$GITHUB_ACTION_PATH` always points to the action's own directory.
+
+**5. `GITHUB_RUN_ID` and `GITHUB_OUTPUT` are already there.** No need to pass them — the runner sets them automatically. Same for `GITHUB_TOKEN` if you needed it (though you don't here).
+
+**Why not use CLI args instead?**
+
+Three reasons, in order of severity:
+
+- **Process listing leak.** `ps -ef` on the runner shows full command lines. On self-hosted Windows runners especially, anything else running on the box (or another job on the same runner if you're not isolating) can see the args. Env vars are per-process.
+- **`set -x` debugging.** If anyone adds `set -x` for troubleshooting, args appear in logs verbatim. Env vars also expand under `-x`, but masking catches them; CLI args sometimes slip past masking when concatenated.
+- **Shell history on persistent runners.** Self-hosted runners that don't reset their state can persist bash history. Env vars die with the process.
+
+**One gotcha specific to your stack:**
+
+On your self-hosted Windows runners, if you're running this in PowerShell instead of bash, the env-var pattern still works but the `$GITHUB_ACTION_PATH` reference becomes `$env:GITHUB_ACTION_PATH`. Worth noting since your composite actions span both runner OSes.
+
+Want me to add the matching `veracode-scan.sh` that consumes `$SANDBOX_ID` and runs the Java wrapper from Nexus?
+
+######
 Here's the bash logic for the dynamic free-sandbox lookup with create-as-fallback. This fits your existing composite action pattern (Java wrapper JAR from Nexus, async polling, honest exit codes).
 
 **Key design decisions worth flagging:**
