@@ -1,0 +1,41 @@
+Here's the bash logic for the dynamic free-sandbox lookup with create-as-fallback. This fits your existing composite action pattern (Java wrapper JAR from Nexus, async polling, honest exit codes).
+
+**Key design decisions worth flagging:**
+
+**Idle detection via `getbuildinfo.do`** — A sandbox is idle if the latest build is in a terminal state (`Results Ready`, `Incomplete`, `Scan Cancelled`, `Pre-Scan Failed`) or has no build at all. Busy states (`Submitted to Engine`, `Scan in Process`, `Pre-Scan Submitted`, `Uploading`) mean skip it.
+
+**Three exit codes for honest signaling** — matches your Veracode composite action's `scan_failed` pattern:
+- `0` → resolved (reused or created), outputs set
+- `1` → API/create failure (hard error)
+- `2` → all 10 busy (caller decides: wait-and-retry, queue, or fail)
+
+**Outputs match your existing convention** — `sandbox_id`, `sandbox_name`, `created` written to `$GITHUB_OUTPUT` so downstream steps can log "reused vs. created" in the Job Summary.
+
+**HMAC auth is stubbed** — the `generate_hmac` function call is a placeholder. In your enterprise setup you'll either source the official Veracode HMAC helper or inline the SHA-256 signing (id + timestamp + nonce + URL + method). If you want, I can write the pure-bash HMAC generator next — same approach you used for the GitHub App JWT (RS256 was harder; HMAC-SHA256 is simpler with `openssl dgst`).
+
+**Caller pattern in the workflow:**
+
+```yaml
+- name: Resolve sandbox
+  id: sandbox
+  run: ./veracode-sandbox-resolve.sh
+  continue-on-error: true
+
+- name: Wait and retry if all busy
+  if: steps.sandbox.outputs.all_busy == 'true'
+  run: |
+    sleep 300
+    ./veracode-sandbox-resolve.sh
+
+- name: Run Veracode scan
+  run: |
+    java -jar VeracodeJavaAPI.jar \
+      -action uploadandscan \
+      -appname "$APP_NAME" \
+      -sandboxid "${{ steps.sandbox.outputs.sandbox_id }}" \
+      ...
+```
+
+**One race-condition caveat:** between "find idle" and "submit scan," another pipeline run could grab the same sandbox. If you're running highly concurrent scans, layer a GitHub Actions `concurrency` group keyed on `${{ steps.sandbox.outputs.sandbox_id }}` to serialize the upload step. Alternatively, accept the rare collision — Veracode will reject the second upload with a clear error and the retry will pick a different sandbox.
+
+Want me to write the HMAC helper, or sketch the wait-and-retry loop with exponential backoff?
