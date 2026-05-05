@@ -1,0 +1,49 @@
+Here's the full composite action wired for the wrapper-only approach, plus a matching scan script that drops all the curl/HMAC plumbing.
+
+Now the matching wrapper-only scan script (replaces all the `curl`/`generate_hmac` calls with `vc_wrapper`):
+
+**Final repo layout:**
+
+```
+.github/actions/veracode-sandbox-scan/
+├── action.yml
+└── scripts/
+    ├── veracode-sandbox-resolve.sh    # the wrapper-only resolve script
+    └── veracode-scan.sh                # this scan script
+```
+
+**What changed from the curl-based version:**
+
+| Concern | Before | Now |
+|---|---|---|
+| Auth | `generate_hmac` per call | `VERACODE_API_KEY_ID` + `VERACODE_API_KEY_SECRET` env vars, set once |
+| Sandbox listing | `curl ... getsandboxlist.do` | `vc_wrapper -action getsandboxlist` |
+| Build status polling | `curl ... getbuildinfo.do` | `vc_wrapper -action getbuildinfo` |
+| Policy report | `curl ... detailedreport.do` | `vc_wrapper -action detailedreport` |
+| Sandbox creation | `curl ... createsandbox.do` | `vc_wrapper -action createsandbox` |
+| Scan submission | wrapper (already) | wrapper (unchanged) |
+
+One auth path. One dependency (the JAR you're already pulling from Nexus). XML parsing via `grep -oP` is the same regardless.
+
+**Caller workflow stays clean:**
+
+```yaml
+- uses: ./.github/actions/veracode-sandbox-scan
+  with:
+    veracode_api_id:    ${{ secrets.VERACODE_API_ID }}
+    veracode_api_key:   ${{ secrets.VERACODE_API_KEY }}
+    veracode_app_id:    ${{ vars.VERACODE_APP_ID }}
+    veracode_app_name:  ${{ vars.VERACODE_APP_NAME }}
+    artifact_path:      ./build/output.jar
+    nexus_wrapper_url:  ${{ vars.NEXUS_VERACODE_WRAPPER_URL }}
+    nexus_username:     ${{ secrets.NEXUS_USERNAME }}
+    nexus_password:     ${{ secrets.NEXUS_PASSWORD }}
+```
+
+**Two implementation notes worth flagging:**
+
+**1. The retry-step env var fallback chain.** `${{ steps.resolve_retry.outputs.sandbox_id || steps.resolve.outputs.sandbox_id }}` — when the retry step doesn't run (because `all_busy` was false), its outputs are empty strings, and the `||` operator falls through to the first-attempt outputs. This means downstream steps don't need to know which resolve step succeeded.
+
+**2. `getbuildinfo` accepts either `-sandboxid` or `-buildid`.** Once you have a build_id, prefer it for polling — it's stable. The sandbox_id-based query returns the *latest* build, which during high concurrency could theoretically be a different scan than the one you just submitted. Build_id is unambiguous.
+
+If you want to test this end-to-end without a real Veracode call, the easiest mock is to swap `vc_wrapper` for a function that echoes canned XML responses. Happy to sketch that test harness if you're planning to add CI for the action itself.
