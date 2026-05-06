@@ -1,0 +1,327 @@
+name: 'Veracode Pipeline Scan'
+description: 'Runs Veracode Pipeline Scan against a built artifact, sourcing pipeline-scan.jar from Nexus.'
+author: 'Platform Engineering'
+
+inputs:
+  # ---- artifact under scan ----
+  scan_file:
+    description: 'Path to the artifact to scan (jar, war, zip, etc.). Must already be built/packaged.'
+    required: true
+
+  # ---- credentials ----
+  veracode_api_id:
+    description: 'Veracode API ID.'
+    required: true
+  veracode_api_key:
+    description: 'Veracode API Key.'
+    required: true
+
+  # ---- jar sourcing (Nexus Raw) ----
+  nexus_url:
+    description: 'Base URL of Nexus (e.g. https://nexus.example.com).'
+    required: true
+  nexus_raw_repo:
+    description: 'Nexus Raw repository hosting pipeline-scan.jar.'
+    required: false
+    default: 'veracode-tools'
+  nexus_jar_path:
+    description: 'Path within the Raw repo to pipeline-scan.jar.'
+    required: false
+    default: 'pipeline-scan/latest/pipeline-scan.jar'
+  nexus_username:
+    description: 'Nexus username for jar download (optional if repo is anonymous).'
+    required: false
+    default: ''
+  nexus_password:
+    description: 'Nexus password / token for jar download.'
+    required: false
+    default: ''
+
+  # ---- scan configuration ----
+  app_name:
+    description: 'Project name reported to Veracode (--project_name).'
+    required: false
+    default: ${{ github.repository }}
+  project_url:
+    description: 'Project URL (--project_url). Defaults to repo URL.'
+    required: false
+    default: ${{ github.server_url }}/${{ github.repository }}
+  project_ref:
+    description: 'Project ref/branch (--project_ref).'
+    required: false
+    default: ${{ github.ref_name }}
+  app_id:
+    description: 'Veracode application profile GUID for policy lookup (--app_id). Optional.'
+    required: false
+    default: ''
+  development_stage:
+    description: 'development | testing | release. Maps to --development_stage.'
+    required: false
+    default: 'development'
+  timeout:
+    description: 'Max scan time in minutes (--timeout).'
+    required: false
+    default: '60'
+
+  # ---- policy / fail criteria ----
+  policy_name:
+    description: 'Veracode policy name (--policy_name). Mutually exclusive with policy_file.'
+    required: false
+    default: ''
+  policy_file:
+    description: 'Path to a downloaded policy file (--policy_file).'
+    required: false
+    default: ''
+  fail_on_severity:
+    description: 'Severity list, e.g. "Very High, High". Used only if no policy_name/policy_file.'
+    required: false
+    default: 'Very High, High'
+  fail_on_cwe:
+    description: 'Comma-separated CWE list (--fail_on_cwe). Optional.'
+    required: false
+    default: ''
+
+  # ---- baseline ----
+  baseline_file:
+    description: 'Path to an existing baseline file to compare against (--baseline_file). Optional.'
+    required: false
+    default: ''
+
+  # ---- failure control (decoupled, like the wrapper action) ----
+  fail_on_policy_violation:
+    description: 'If true, fail the step when Pipeline Scan reports policy-failing findings (exit 1).'
+    required: false
+    default: 'true'
+  fail_workflow_on_error:
+    description: 'If true, fail the step when Pipeline Scan errors out (exit code other than 0 or 1).'
+    required: false
+    default: 'true'
+
+  # ---- artifact handling ----
+  results_filename:
+    description: 'Filename for results JSON written by the scan.'
+    required: false
+    default: 'veracode-pipeline-results.json'
+  upload_results_artifact:
+    description: 'If true, uploads results.json + filtered/summary outputs as a workflow artifact.'
+    required: false
+    default: 'true'
+  results_artifact_name:
+    description: 'Name of the uploaded artifact.'
+    required: false
+    default: 'veracode-pipeline-scan-results'
+
+outputs:
+  scan_exit_code:
+    description: 'Raw exit code from pipeline-scan.jar (0=clean, 1=findings, other=error).'
+    value: ${{ steps.scan.outputs.scan_exit_code }}
+  policy_violation:
+    description: 'true if pipeline-scan reported policy-failing findings (exit 1).'
+    value: ${{ steps.scan.outputs.policy_violation }}
+  scan_failed:
+    description: 'true if pipeline-scan errored out (exit code other than 0 or 1).'
+    value: ${{ steps.scan.outputs.scan_failed }}
+  results_path:
+    description: 'Absolute path to the results JSON file.'
+    value: ${{ steps.scan.outputs.results_path }}
+  findings_count:
+    description: 'Total number of findings in results.json (0 if file missing).'
+    value: ${{ steps.summary.outputs.findings_count }}
+  policy_failing_count:
+    description: 'Number of policy-failing findings in results.json (0 if file missing).'
+    value: ${{ steps.summary.outputs.policy_failing_count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ ! -f "${{ inputs.scan_file }}" ]]; then
+          echo "::error::scan_file '${{ inputs.scan_file }}' does not exist."
+          exit 1
+        fi
+        if [[ -n "${{ inputs.policy_name }}" && -n "${{ inputs.policy_file }}" ]]; then
+          echo "::error::policy_name and policy_file are mutually exclusive."
+          exit 1
+        fi
+        # Validate Java is present (pipeline-scan.jar requires Java 8+).
+        if ! command -v java >/dev/null 2>&1; then
+          echo "::error::java not found on runner. Pipeline Scan requires Java 8 or later."
+          exit 1
+        fi
+        java -version
+
+    - name: Download pipeline-scan.jar from Nexus
+      id: download
+      shell: bash
+      env:
+        NEXUS_USER: ${{ inputs.nexus_username }}
+        NEXUS_PASS: ${{ inputs.nexus_password }}
+      run: |
+        set -euo pipefail
+        JAR_DIR="${RUNNER_TEMP}/veracode-pipeline-scan"
+        mkdir -p "${JAR_DIR}"
+        JAR_PATH="${JAR_DIR}/pipeline-scan.jar"
+
+        URL="${{ inputs.nexus_url }}/repository/${{ inputs.nexus_raw_repo }}/${{ inputs.nexus_jar_path }}"
+        echo "Downloading pipeline-scan.jar from: ${URL}"
+
+        AUTH_ARGS=()
+        if [[ -n "${NEXUS_USER}" && -n "${NEXUS_PASS}" ]]; then
+          AUTH_ARGS=(-u "${NEXUS_USER}:${NEXUS_PASS}")
+        fi
+
+        HTTP_CODE=$(curl -sSL -w "%{http_code}" -o "${JAR_PATH}" "${AUTH_ARGS[@]}" "${URL}")
+        if [[ "${HTTP_CODE}" != "200" ]]; then
+          echo "::error::Failed to download pipeline-scan.jar from Nexus. HTTP ${HTTP_CODE}"
+          exit 1
+        fi
+
+        # Sanity check: must be a real jar (PK zip header).
+        if ! head -c 2 "${JAR_PATH}" | grep -q "PK"; then
+          echo "::error::Downloaded file is not a valid jar (missing PK header)."
+          exit 1
+        fi
+
+        echo "jar_path=${JAR_PATH}" >> "${GITHUB_OUTPUT}"
+        ls -lh "${JAR_PATH}"
+
+    - name: Run Veracode Pipeline Scan
+      id: scan
+      shell: bash
+      env:
+        VERACODE_API_ID: ${{ inputs.veracode_api_id }}
+        VERACODE_API_KEY: ${{ inputs.veracode_api_key }}
+      run: |
+        set +e  # we manage exit codes explicitly
+        # Mask credentials on the off-chance they leak.
+        echo "::add-mask::${VERACODE_API_ID}"
+        echo "::add-mask::${VERACODE_API_KEY}"
+
+        JAR_PATH="${{ steps.download.outputs.jar_path }}"
+        RESULTS_PATH="${GITHUB_WORKSPACE}/${{ inputs.results_filename }}"
+
+        # Build argument array. Optional flags are appended only when set,
+        # to avoid passing empty strings that the jar would reject.
+        ARGS=(
+          -jar "${JAR_PATH}"
+          --veracode_api_id "${VERACODE_API_ID}"
+          --veracode_api_key "${VERACODE_API_KEY}"
+          --file "${{ inputs.scan_file }}"
+          --json_output_file "${RESULTS_PATH}"
+          --project_name "${{ inputs.app_name }}"
+          --project_url "${{ inputs.project_url }}"
+          --project_ref "${{ inputs.project_ref }}"
+          --development_stage "${{ inputs.development_stage }}"
+          --timeout "${{ inputs.timeout }}"
+        )
+
+        if [[ -n "${{ inputs.app_id }}" ]]; then
+          ARGS+=(--app_id "${{ inputs.app_id }}")
+        fi
+        if [[ -n "${{ inputs.policy_name }}" ]]; then
+          ARGS+=(--policy_name "${{ inputs.policy_name }}")
+        elif [[ -n "${{ inputs.policy_file }}" ]]; then
+          ARGS+=(--policy_file "${{ inputs.policy_file }}")
+        else
+          ARGS+=(--fail_on_severity "${{ inputs.fail_on_severity }}")
+        fi
+        if [[ -n "${{ inputs.fail_on_cwe }}" ]]; then
+          ARGS+=(--fail_on_cwe "${{ inputs.fail_on_cwe }}")
+        fi
+        if [[ -n "${{ inputs.baseline_file }}" ]]; then
+          if [[ ! -f "${{ inputs.baseline_file }}" ]]; then
+            echo "::warning::baseline_file '${{ inputs.baseline_file }}' not found, scanning without baseline."
+          else
+            ARGS+=(--baseline_file "${{ inputs.baseline_file }}")
+          fi
+        fi
+
+        echo "Invoking pipeline-scan.jar..."
+        java "${ARGS[@]}"
+        SCAN_EXIT=$?
+        set -e
+
+        echo "Pipeline Scan exit code: ${SCAN_EXIT}"
+        echo "scan_exit_code=${SCAN_EXIT}" >> "${GITHUB_OUTPUT}"
+        echo "results_path=${RESULTS_PATH}" >> "${GITHUB_OUTPUT}"
+
+        # Decoupled status flags
+        if [[ "${SCAN_EXIT}" -eq 0 ]]; then
+          echo "policy_violation=false" >> "${GITHUB_OUTPUT}"
+          echo "scan_failed=false" >> "${GITHUB_OUTPUT}"
+        elif [[ "${SCAN_EXIT}" -eq 1 ]]; then
+          echo "policy_violation=true" >> "${GITHUB_OUTPUT}"
+          echo "scan_failed=false" >> "${GITHUB_OUTPUT}"
+        else
+          echo "policy_violation=false" >> "${GITHUB_OUTPUT}"
+          echo "scan_failed=true" >> "${GITHUB_OUTPUT}"
+        fi
+
+    - name: Summarise findings
+      id: summary
+      if: always()
+      shell: bash
+      run: |
+        set -euo pipefail
+        RESULTS_PATH="${{ steps.scan.outputs.results_path }}"
+        FINDINGS_COUNT=0
+        POLICY_FAILING=0
+
+        if [[ -f "${RESULTS_PATH}" ]]; then
+          if command -v jq >/dev/null 2>&1; then
+            FINDINGS_COUNT=$(jq '[.findings[]?] | length' "${RESULTS_PATH}")
+            # Pipeline Scan marks policy-failing findings via the policy result.
+            # Be permissive about schema variations between jar versions.
+            POLICY_FAILING=$(jq '[.findings[]? | select((.policy_violation // false) == true or (.violates_policy // false) == true)] | length' "${RESULTS_PATH}")
+          else
+            echo "::warning::jq not available; skipping JSON summary."
+          fi
+        else
+          echo "::warning::Results file not found at ${RESULTS_PATH}."
+        fi
+
+        echo "findings_count=${FINDINGS_COUNT}" >> "${GITHUB_OUTPUT}"
+        echo "policy_failing_count=${POLICY_FAILING}" >> "${GITHUB_OUTPUT}"
+
+        {
+          echo "## Veracode Pipeline Scan"
+          echo ""
+          echo "| Metric | Value |"
+          echo "| --- | --- |"
+          echo "| Scan exit code | \`${{ steps.scan.outputs.scan_exit_code }}\` |"
+          echo "| Policy violation | \`${{ steps.scan.outputs.policy_violation }}\` |"
+          echo "| Scan errored | \`${{ steps.scan.outputs.scan_failed }}\` |"
+          echo "| Total findings | \`${FINDINGS_COUNT}\` |"
+          echo "| Policy-failing findings | \`${POLICY_FAILING}\` |"
+          echo "| Results file | \`${{ inputs.results_filename }}\` |"
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+    - name: Upload results artifact
+      if: always() && inputs.upload_results_artifact == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.results_artifact_name }}
+        path: ${{ steps.scan.outputs.results_path }}
+        if-no-files-found: warn
+        retention-days: 30
+
+    - name: Enforce failure policy
+      if: always()
+      shell: bash
+      run: |
+        set -euo pipefail
+        SCAN_FAILED="${{ steps.scan.outputs.scan_failed }}"
+        POLICY_VIOLATION="${{ steps.scan.outputs.policy_violation }}"
+
+        if [[ "${SCAN_FAILED}" == "true" && "${{ inputs.fail_workflow_on_error }}" == "true" ]]; then
+          echo "::error::Pipeline Scan errored (exit ${{ steps.scan.outputs.scan_exit_code }}). Failing step per fail_workflow_on_error=true."
+          exit 1
+        fi
+        if [[ "${POLICY_VIOLATION}" == "true" && "${{ inputs.fail_on_policy_violation }}" == "true" ]]; then
+          echo "::error::Pipeline Scan reported policy-failing findings. Failing step per fail_on_policy_violation=true."
+          exit 1
+        fi
+        echo "Pipeline Scan completed within configured failure policy."
