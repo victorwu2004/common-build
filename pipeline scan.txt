@@ -1,0 +1,43 @@
+I'll create a composite action for Veracode Pipeline Scan, following the same patterns you've used for the wrapper-based scans (Nexus-sourced JAR, decoupled failure control, honest outputs).
+
+Quick note on Pipeline Scan vs Policy/Sandbox: Pipeline Scan is a different tool (`pipeline-scan.jar`, not the Java wrapper). It runs synchronously, returns flaws as JSON, and is meant for fast PR-gate feedback. No async polling needed.
+
+Here's the composite action:
+
+## Key design choices (consistent with your wrapper action)
+
+**Nexus as JAR source.** Pipeline Scan ships as `pipeline-scan.jar` — same pattern as the wrapper: download from a Nexus raw repo with basic auth, validate non-empty, run from `$RUNNER_TEMP`.
+
+**Decoupled failure control.** Two independent toggles:
+- `fail_workflow_on_error` — infrastructure failures (JAR download, scan invocation, missing results file)
+- `fail_on_policy_violation` — actual flaw findings that breach the gate
+
+This lets you run scan-only PRs (collect findings, don't block) while still failing hard on real infra problems.
+
+**Honest `scan_failed` output.** Pipeline Scan's exit code is overloaded — non-zero means *either* flaws found *or* JVM/network failure. The action distinguishes by checking whether `results.json` was produced and parseable. No file = `scan_failed=true`. File present + non-zero exit = `policy_violation=true`.
+
+**Severity mapping.** Friendly names (`Very High,High`) get translated to Veracode's numeric scale (5/4/3/2/1/0) for `--fail_on_severity`. `policy_file` overrides this when supplied.
+
+## Calling pattern
+
+```yaml
+- uses: ./.github/actions/veracode-pipeline-scan
+  with:
+    artifact_path: ${{ steps.download.outputs.path }}
+    app_name: my-service
+    veracode_api_id: ${{ secrets.VERACODE_API_ID }}
+    veracode_api_key: ${{ secrets.VERACODE_API_KEY }}
+    nexus_url: https://nexus.corp.example.com
+    nexus_user: ${{ secrets.NEXUS_USER }}
+    nexus_password: ${{ secrets.NEXUS_PASSWORD }}
+    fail_on_severity: 'Very High,High'
+    baseline_file: .veracode/baseline.json
+    fail_on_policy_violation: true
+    fail_workflow_on_error: true
+```
+
+## Pipeline Scan vs Wrapper — when to use which
+
+Pipeline Scan is for **fast PR feedback** — typically 60s–10min, returns flaws as JSON, no asynchronous polling, no Veracode platform record. Use it as a PR gate. The wrapper-based policy/sandbox scan is the system of record (longer SLA, full SAST coverage, platform reporting). Most teams run both: Pipeline on PRs, full policy scan on `main` merges or release tags.
+
+One thing worth flagging: Pipeline Scan supports an `--issue_details true` flag for richer per-finding output if you want to feed flaws into a PR comment. I left that off by default since it bloats the JSON, but easy to add as another input if you want PR annotations.
