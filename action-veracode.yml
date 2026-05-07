@@ -1,0 +1,379 @@
+name: 'Veracode Wrapper Scan'
+description: 'Run Veracode pipeline, sandbox, or policy scans through the Java wrapper, sourced from Nexus. Single endpoint (analysiscenter.veracode.com), decoupled failure control.'
+
+inputs:
+  # ---- scan mode ----
+  scan_mode:
+    description: 'Scan type: pipeline | sandbox | policy'
+    required: true
+
+  # ---- artifact ----
+  artifact_path:
+    description: 'Path to the artifact to scan (zip, jar, war, ear, etc.)'
+    required: true
+  app_name:
+    description: 'Veracode application profile name (must match platform). Used by sandbox/policy modes; used as project_name in pipeline mode.'
+    required: true
+  app_version:
+    description: 'Scan/build version label. Defaults to commit SHA.'
+    required: false
+    default: ${{ github.sha }}
+
+  # ---- credentials ----
+  veracode_api_id:
+    description: 'Veracode API ID'
+    required: true
+  veracode_api_key:
+    description: 'Veracode API Key'
+    required: true
+
+  # ---- Nexus jar sourcing ----
+  nexus_url:
+    description: 'Base URL of Nexus (e.g. https://nexus.corp.example.com)'
+    required: true
+  nexus_repo:
+    description: 'Nexus raw repo where the wrapper JAR is hosted'
+    required: false
+    default: 'veracode-tools'
+  nexus_jar_path:
+    description: 'Path within the Nexus repo to the Veracode wrapper JAR'
+    required: false
+    default: 'veracode-wrapper/latest/veracode-wrapper.jar'
+  nexus_user:
+    description: 'Nexus username'
+    required: true
+  nexus_password:
+    description: 'Nexus password/token'
+    required: true
+
+  # ---- sandbox-specific ----
+  sandbox_name:
+    description: 'Sandbox name (sandbox mode only). Required if scan_mode=sandbox.'
+    required: false
+    default: ''
+  create_sandbox:
+    description: 'If true, create the sandbox if it does not exist (sandbox mode only)'
+    required: false
+    default: 'true'
+
+  # ---- policy/sandbox shared ----
+  create_profile:
+    description: 'If true, create the application profile if it does not exist'
+    required: false
+    default: 'false'
+  teams:
+    description: 'Comma-separated team names to associate with a newly created profile'
+    required: false
+    default: ''
+  business_criticality:
+    description: 'Business criticality for new profiles (Very High | High | Medium | Low | Very Low)'
+    required: false
+    default: 'High'
+  wait_for_scan:
+    description: 'If true, wait for sandbox/policy scan to complete and surface results. If false, kick off and return.'
+    required: false
+    default: 'true'
+  scan_timeout_minutes:
+    description: 'Max minutes to wait for sandbox/policy scan completion'
+    required: false
+    default: '120'
+
+  # ---- pipeline-specific ----
+  fail_on_severity:
+    description: 'Pipeline mode: comma-separated severities that mark scan as policy_violation (Very High,High,Medium,Low,Very Low,Informational)'
+    required: false
+    default: 'Very High,High'
+  fail_on_cwe:
+    description: 'Pipeline mode: comma-separated CWE IDs that always fail'
+    required: false
+    default: ''
+  baseline_file:
+    description: 'Pipeline mode: optional baseline JSON file to suppress accepted findings'
+    required: false
+    default: ''
+  policy_file:
+    description: 'Pipeline mode: optional Veracode policy JSON file (overrides fail_on_severity)'
+    required: false
+    default: ''
+  pipeline_timeout_minutes:
+    description: 'Pipeline mode: scan timeout'
+    required: false
+    default: '60'
+
+  # ---- failure control (shared) ----
+  fail_on_policy_violation:
+    description: 'If true, the action exits 1 when findings violate policy/severity gates. Pipeline + policy modes only.'
+    required: false
+    default: 'true'
+  fail_workflow_on_error:
+    description: 'If true, infrastructure errors fail the step. If false, errors set scan_failed=true but exit 0'
+    required: false
+    default: 'true'
+
+  # ---- endpoint (single allowlisted host) ----
+  veracode_host:
+    description: 'Veracode hostname (default analysiscenter.veracode.com — the host already allowlisted for the wrapper)'
+    required: false
+    default: 'analysiscenter.veracode.com'
+
+outputs:
+  scan_mode:
+    description: 'Echoes the scan mode that ran'
+    value: ${{ inputs.scan_mode }}
+  scan_failed:
+    description: 'true if scan could not complete due to infrastructure error'
+    value: ${{ steps.run.outputs.scan_failed }}
+  policy_violation:
+    description: 'true if findings violate the configured policy/severity gates (pipeline + policy modes)'
+    value: ${{ steps.run.outputs.policy_violation }}
+  findings_count:
+    description: 'Total findings (pipeline mode) or flaws not passing policy (policy mode)'
+    value: ${{ steps.run.outputs.findings_count }}
+  results_path:
+    description: 'Path to results file (JSON for pipeline, summary text for sandbox/policy)'
+    value: ${{ steps.run.outputs.results_path }}
+  build_id:
+    description: 'Veracode build ID (sandbox/policy modes)'
+    value: ${{ steps.run.outputs.build_id }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "${{ inputs.scan_mode }}" in
+          pipeline|sandbox|policy) ;;
+          *)
+            echo "::error::scan_mode must be one of: pipeline, sandbox, policy (got '${{ inputs.scan_mode }}')"
+            exit 1
+            ;;
+        esac
+        if [[ ! -f "${{ inputs.artifact_path }}" ]]; then
+          echo "::error::Artifact not found: ${{ inputs.artifact_path }}"
+          exit 1
+        fi
+        if [[ "${{ inputs.scan_mode }}" == "sandbox" && -z "${{ inputs.sandbox_name }}" ]]; then
+          echo "::error::sandbox_name is required when scan_mode=sandbox"
+          exit 1
+        fi
+        echo "Mode: ${{ inputs.scan_mode }}"
+        echo "Artifact: ${{ inputs.artifact_path }}"
+        echo "App: ${{ inputs.app_name }}"
+        echo "Endpoint: ${{ inputs.veracode_host }}"
+
+    - name: Download Veracode wrapper JAR from Nexus
+      shell: bash
+      env:
+        NEXUS_USER: ${{ inputs.nexus_user }}
+        NEXUS_PASSWORD: ${{ inputs.nexus_password }}
+      run: |
+        set -euo pipefail
+        JAR_URL="${{ inputs.nexus_url }}/repository/${{ inputs.nexus_repo }}/${{ inputs.nexus_jar_path }}"
+        echo "Downloading wrapper JAR from: $JAR_URL"
+        HTTP_CODE=$(curl -sS -w "%{http_code}" -o "$RUNNER_TEMP/veracode-wrapper.jar" \
+          -u "$NEXUS_USER:$NEXUS_PASSWORD" "$JAR_URL")
+        if [[ "$HTTP_CODE" != "200" ]]; then
+          echo "::error::Failed to download wrapper JAR (HTTP $HTTP_CODE)"
+          exit 1
+        fi
+        if [[ ! -s "$RUNNER_TEMP/veracode-wrapper.jar" ]]; then
+          echo "::error::Wrapper JAR is empty"
+          exit 1
+        fi
+
+    - name: Run scan
+      id: run
+      shell: bash
+      env:
+        VID: ${{ inputs.veracode_api_id }}
+        VKEY: ${{ inputs.veracode_api_key }}
+        VHOST: ${{ inputs.veracode_host }}
+      run: |
+        set +e
+        SCAN_FAILED=false
+        POLICY_VIOLATION=false
+        FINDINGS_COUNT=0
+        BUILD_ID=""
+        RESULTS_PATH=""
+
+        WRAPPER="$RUNNER_TEMP/veracode-wrapper.jar"
+        MODE="${{ inputs.scan_mode }}"
+
+        # ---- common args. Wrapper supports overriding host via -Dveracode.api.base.url
+        # and -api1.host. Pinning both for safety; both resolve to the allowlisted host.
+        COMMON_PROPS=(
+          -Dveracode.api.base.url="https://$VHOST/"
+          -Dveracode.wrapper.api.host="$VHOST"
+        )
+
+        echo "::group::Wrapper: $($JAVA_HOME/bin/java "${COMMON_PROPS[@]}" -jar "$WRAPPER" -version 2>&1 || true)"
+        echo "::endgroup::"
+
+        case "$MODE" in
+          pipeline)
+            echo "=== Pipeline Scan via wrapper ==="
+            RESULTS_JSON="$RUNNER_TEMP/veracode-pipeline-results.json"
+            SUMMARY_TXT="$RUNNER_TEMP/veracode-pipeline-summary.txt"
+            RESULTS_PATH="$RESULTS_JSON"
+
+            # Map friendly severity names to numeric (5=VeryHigh ... 0=Info), pick lowest
+            IFS=',' read -ra SEVS <<< "${{ inputs.fail_on_severity }}"
+            MIN_SEV=5
+            for s in "${SEVS[@]}"; do
+              case "$(echo "$s" | xargs | tr '[:upper:]' '[:lower:]')" in
+                "very high") n=5 ;;
+                "high") n=4 ;;
+                "medium") n=3 ;;
+                "low") n=2 ;;
+                "very low") n=1 ;;
+                "informational"|"info") n=0 ;;
+                *) continue ;;
+              esac
+              (( n < MIN_SEV )) && MIN_SEV=$n
+            done
+
+            ARGS=(
+              "${COMMON_PROPS[@]}"
+              -jar "$WRAPPER"
+              -action pipelineScan
+              -vid "$VID"
+              -vkey "$VKEY"
+              -file "${{ inputs.artifact_path }}"
+              -projectName "${{ inputs.app_name }}"
+              -jsonOutput true
+              -jsonOutputFile "$RESULTS_JSON"
+              -summaryOutput true
+              -summaryOutputFile "$SUMMARY_TXT"
+              -timeout "${{ inputs.pipeline_timeout_minutes }}"
+            )
+
+            if [[ -n "${{ inputs.policy_file }}" && -f "${{ inputs.policy_file }}" ]]; then
+              ARGS+=( -policyFile "${{ inputs.policy_file }}" )
+            else
+              ARGS+=( -failOnSeverity "$MIN_SEV" )
+            fi
+            [[ -n "${{ inputs.fail_on_cwe }}" ]] && ARGS+=( -failOnCWE "${{ inputs.fail_on_cwe }}" )
+            [[ -n "${{ inputs.baseline_file }}" && -f "${{ inputs.baseline_file }}" ]] && ARGS+=( -baselineFile "${{ inputs.baseline_file }}" )
+
+            java "${ARGS[@]}"
+            EXIT_CODE=$?
+
+            [[ -f "$SUMMARY_TXT" ]] && { echo "::group::Pipeline summary"; cat "$SUMMARY_TXT"; echo "::endgroup::"; }
+
+            if [[ -f "$RESULTS_JSON" ]]; then
+              FINDINGS_COUNT=$(jq '.findings | length' "$RESULTS_JSON" 2>/dev/null || echo 0)
+              [[ $EXIT_CODE -ne 0 ]] && POLICY_VIOLATION=true
+            else
+              SCAN_FAILED=true
+              echo "::error::Pipeline Scan produced no results file (exit $EXIT_CODE) — check connectivity to $VHOST"
+            fi
+            ;;
+
+          sandbox|policy)
+            echo "=== ${MODE^} Scan via wrapper (uploadandscan) ==="
+            SUMMARY_TXT="$RUNNER_TEMP/veracode-${MODE}-summary.txt"
+            BUILD_ID_FILE="$RUNNER_TEMP/veracode-${MODE}-buildid.txt"
+            RESULTS_PATH="$SUMMARY_TXT"
+
+            ARGS=(
+              "${COMMON_PROPS[@]}"
+              -jar "$WRAPPER"
+              -action uploadandscan
+              -vid "$VID"
+              -vkey "$VKEY"
+              -appname "${{ inputs.app_name }}"
+              -version "${{ inputs.app_version }}"
+              -filepath "${{ inputs.artifact_path }}"
+              -criticality "${{ inputs.business_criticality }}"
+              -scantimeout "${{ inputs.scan_timeout_minutes }}"
+            )
+
+            [[ "${{ inputs.create_profile }}" == "true" ]] && ARGS+=( -createprofile true )
+            [[ -n "${{ inputs.teams }}" ]] && ARGS+=( -teams "${{ inputs.teams }}" )
+
+            if [[ "$MODE" == "sandbox" ]]; then
+              ARGS+=( -sandboxname "${{ inputs.sandbox_name }}" )
+              [[ "${{ inputs.create_sandbox }}" == "true" ]] && ARGS+=( -createsandbox true )
+            fi
+
+            if [[ "${{ inputs.wait_for_scan }}" != "true" ]]; then
+              # Use uploadfile + beginscan for fire-and-forget. Simpler: -scanpollinginterval 0 isn't supported,
+              # so we fall back to uploadandscan which always waits. If wait_for_scan=false, switch action.
+              ARGS=(
+                "${COMMON_PROPS[@]}"
+                -jar "$WRAPPER"
+                -action uploadfile
+                -vid "$VID"
+                -vkey "$VKEY"
+                -appname "${{ inputs.app_name }}"
+                -version "${{ inputs.app_version }}"
+                -filepath "${{ inputs.artifact_path }}"
+              )
+              [[ "${{ inputs.create_profile }}" == "true" ]] && ARGS+=( -createprofile true )
+              [[ "$MODE" == "sandbox" ]] && ARGS+=( -sandboxname "${{ inputs.sandbox_name }}" )
+              [[ "$MODE" == "sandbox" && "${{ inputs.create_sandbox }}" == "true" ]] && ARGS+=( -createsandbox true )
+            fi
+
+            java "${ARGS[@]}" | tee "$SUMMARY_TXT"
+            EXIT_CODE=$?
+
+            # Extract build id if wrapper printed it
+            BUILD_ID=$(grep -oE 'build_id="[0-9]+"' "$SUMMARY_TXT" | head -1 | grep -oE '[0-9]+' || true)
+            [[ -n "$BUILD_ID" ]] && echo "$BUILD_ID" > "$BUILD_ID_FILE"
+
+            if [[ $EXIT_CODE -ne 0 ]]; then
+              # uploadandscan returns non-zero when scan completed but failed policy (policy mode)
+              # vs infrastructure failure. Heuristic: if summary mentions "Did Not Pass" / "Conditional Pass",
+              # treat as policy_violation, not scan_failed.
+              if grep -qiE "Did Not Pass|Conditional Pass|policy_compliance_status=\"Did Not Pass\"" "$SUMMARY_TXT"; then
+                POLICY_VIOLATION=true
+                FINDINGS_COUNT=$(grep -oE 'flaws_not_passing_policy="[0-9]+"' "$SUMMARY_TXT" | head -1 | grep -oE '[0-9]+' || echo 0)
+              else
+                SCAN_FAILED=true
+                echo "::error::${MODE^} scan failed (exit $EXIT_CODE) — see summary above"
+              fi
+            else
+              FINDINGS_COUNT=$(grep -oE 'flaws_not_passing_policy="[0-9]+"' "$SUMMARY_TXT" | head -1 | grep -oE '[0-9]+' || echo 0)
+            fi
+            ;;
+        esac
+
+        # ---- Job summary ----
+        {
+          echo "## Veracode ${MODE^} Scan"
+          echo "| Field | Value |"
+          echo "|---|---|"
+          echo "| Mode | $MODE |"
+          echo "| Application | ${{ inputs.app_name }} |"
+          [[ "$MODE" == "sandbox" ]] && echo "| Sandbox | ${{ inputs.sandbox_name }} |"
+          echo "| Endpoint | $VHOST |"
+          echo "| Findings / flaws not passing | $FINDINGS_COUNT |"
+          [[ -n "$BUILD_ID" ]] && echo "| Build ID | $BUILD_ID |"
+          echo "| Scan failed | $SCAN_FAILED |"
+          echo "| Policy violation | $POLICY_VIOLATION |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        echo "scan_failed=$SCAN_FAILED" >> "$GITHUB_OUTPUT"
+        echo "policy_violation=$POLICY_VIOLATION" >> "$GITHUB_OUTPUT"
+        echo "findings_count=$FINDINGS_COUNT" >> "$GITHUB_OUTPUT"
+        echo "results_path=$RESULTS_PATH" >> "$GITHUB_OUTPUT"
+        echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+
+        # ---- Decoupled failure control ----
+        if [[ "$SCAN_FAILED" == "true" && "${{ inputs.fail_workflow_on_error }}" == "true" ]]; then
+          exit 1
+        fi
+        if [[ "$POLICY_VIOLATION" == "true" && "${{ inputs.fail_on_policy_violation }}" == "true" ]]; then
+          exit 1
+        fi
+        exit 0
+
+    - name: Upload results artifact
+      if: always() && steps.run.outputs.results_path != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: veracode-${{ inputs.scan_mode }}-${{ inputs.app_name }}
+        path: ${{ steps.run.outputs.results_path }}
+        if-no-files-found: warn
