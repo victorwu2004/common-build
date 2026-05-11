@@ -1,0 +1,82 @@
+Here's the updated composite with zip-based distribution, all integrity checks, and robust extraction:
+
+## What's structurally different
+
+**Five separate steps, each with one job.** Easier to debug — when something fails, the GitHub Actions UI tells you exactly which stage broke.
+
+1. **Validate inputs** — artifact exists and isn't empty
+2. **Download zip from Nexus** — HTTP code checked, size captured
+3. **Validate zip integrity** — magic bytes, size sanity, `unzip -tq`
+4. **Extract and prepare JAR** — flat extraction, find the jar, chmod, manifest check, smoke test with `--version`
+5. **Run Pipeline Scan** — the actual scan with decoupled failure control
+
+## Defensive checks at every boundary
+
+These are the things that bit you, all caught explicitly with diagnostic output:
+
+- **HTTP non-200 from Nexus** → dumps first 500 bytes so you can see if it's an HTML error page
+- **Zip too small** → almost certainly an error page; dump contents
+- **Wrong magic bytes** → `file` output tells you what it actually is
+- **`unzip -tq` failure** → transit corruption (your wrapper-binary-corruption pattern from April)
+- **No jar found after extract** → lists what was extracted so you can see the layout
+- **No Main-Class** → prints the manifest for inspection
+- **`--version` smoke test** → catches anything else the static checks missed before you hit the actual scan
+
+Each check fails with a clear `::error::` line saying exactly what's wrong, instead of letting the scan run and report "network error."
+
+## Specific to your earlier issue
+
+`unzip -j` (junk paths) extracts everything flat into `$WORK_DIR`. No more "is it in a subdirectory?" guessing.
+
+`chmod 644` on the extracted JAR — fixes the permissions issue you hit. JARs need read but not execute.
+
+`find ... -name "pipeline-scan*.jar"` — handles both `pipeline-scan.jar` and versioned names like `pipeline-scan-25.4.0.jar` (Veracode does ship versioned filenames in some distributions).
+
+## Calling pattern (unchanged from before)
+
+```yaml
+- uses: ./.github/actions/veracode-pipeline-scan
+  with:
+    artifact_path: build/app.zip
+    app_name: my-service
+    veracode_api_id: ${{ secrets.VERACODE_API_ID }}
+    veracode_api_key: ${{ secrets.VERACODE_API_KEY }}
+    nexus_url: https://nexus.corp.example.com
+    nexus_user: ${{ secrets.NEXUS_USER }}
+    nexus_password: ${{ secrets.NEXUS_PASSWORD }}
+    fail_on_severity: 'Very High,High'
+    baseline_file: .veracode/baseline.json
+```
+
+You only need to change anything if your Nexus zip path differs from the default `pipeline-scan/latest/pipeline-scan-LATEST.zip`.
+
+## Seeding Nexus (one-time, from a trusted workstation)
+
+```bash
+# 1. Pull from Veracode
+curl -L -o pipeline-scan-LATEST.zip \
+  https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
+
+# 2. Sanity check locally
+unzip -tq pipeline-scan-LATEST.zip
+unzip -j pipeline-scan-LATEST.zip pipeline-scan.jar -d /tmp/
+java -jar /tmp/pipeline-scan.jar --version
+
+# 3. Upload to Nexus with explicit content-type
+curl -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+  --upload-file pipeline-scan-LATEST.zip \
+  -H "Content-Type: application/zip" \
+  "$NEXUS_URL/repository/veracode-tools/pipeline-scan/latest/pipeline-scan-LATEST.zip"
+
+# 4. Round-trip verify
+curl -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+  -o /tmp/roundtrip.zip \
+  "$NEXUS_URL/repository/veracode-tools/pipeline-scan/latest/pipeline-scan-LATEST.zip"
+
+# sha256 must match
+sha256sum pipeline-scan-LATEST.zip /tmp/roundtrip.zip
+```
+
+If the sha256s match, you've proven the Nexus upload pipeline isn't mangling the file. If they don't match, that's the diagnosis you bring back to whoever maintains Nexus — same investigation pattern as your wrapper binary-corruption work.
+
+Once you run this once and confirm it works, this composite becomes your durable Pipeline Scan path. Updates are one step (replace the zip in Nexus), and the integrity checks make it self-diagnosing for the next person who hits a weird failure.
