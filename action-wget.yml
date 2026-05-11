@@ -1,0 +1,409 @@
+name: 'Veracode Wrapper Scan (Sandbox/Policy)'
+description: 'Run Veracode sandbox or policy scans through the Java API wrapper. Downloads the wrapper JAR from Nexus via wget, preserving the server-provided filename.'
+
+inputs:
+  # ---- scan mode ----
+  scan_mode:
+    description: 'Scan type: sandbox | policy. (Pipeline scan requires pipeline-scan.jar — separate composite.)'
+    required: true
+
+  # ---- artifact ----
+  artifact_path:
+    description: 'Path to the artifact to scan (zip, jar, war, ear, etc.)'
+    required: true
+  app_name:
+    description: 'Veracode application profile name (must match platform exactly)'
+    required: true
+  app_version:
+    description: 'Scan/build version label. Defaults to commit SHA.'
+    required: false
+    default: ${{ github.sha }}
+
+  # ---- credentials ----
+  veracode_api_id:
+    description: 'Veracode API ID'
+    required: true
+  veracode_api_key:
+    description: 'Veracode API Key'
+    required: true
+
+  # ---- Nexus sourcing ----
+  nexus_url:
+    description: 'Base URL of Nexus (e.g. https://nexus.corp.example.com)'
+    required: true
+  nexus_repo:
+    description: 'Nexus raw repo where the wrapper JAR is hosted'
+    required: false
+    default: 'veracode-tools'
+  nexus_jar_path:
+    description: 'Path within the Nexus repo to the wrapper JAR. Server-provided filename (via Content-Disposition) is preserved when available.'
+    required: false
+    default: 'vosp-api-wrappers-java/latest/vosp-api-wrappers-java-with-dependencies.jar'
+  nexus_user:
+    description: 'Nexus username'
+    required: true
+  nexus_password:
+    description: 'Nexus password/token'
+    required: true
+
+  # ---- sandbox-specific ----
+  sandbox_name:
+    description: 'Sandbox name (required if scan_mode=sandbox)'
+    required: false
+    default: ''
+  create_sandbox:
+    description: 'If true, create the sandbox if it does not exist'
+    required: false
+    default: 'true'
+
+  # ---- profile / scan settings ----
+  create_profile:
+    description: 'If true, create the application profile if it does not exist'
+    required: false
+    default: 'false'
+  teams:
+    description: 'Comma-separated team names for new profile'
+    required: false
+    default: ''
+  business_criticality:
+    description: 'Business criticality for new profile (Very High | High | Medium | Low | Very Low)'
+    required: false
+    default: 'High'
+  scan_all_nonfatal_top_level_modules:
+    description: 'Pass -scanallnonfataltoplevelmodules true to wrapper'
+    required: false
+    default: 'true'
+  include_new_modules:
+    description: 'Pass -includenewmodules true to wrapper'
+    required: false
+    default: 'true'
+
+  # ---- wait behavior ----
+  wait_for_scan:
+    description: 'If true (default), use uploadandscan and wait. If false, use uploadfile and return immediately.'
+    required: false
+    default: 'true'
+  scan_timeout_minutes:
+    description: 'Max minutes to wait for scan completion (wait_for_scan=true only)'
+    required: false
+    default: '120'
+
+  # ---- failure control ----
+  fail_on_policy_violation:
+    description: 'If true, exit 1 when policy mode finds non-passing scan. Sandbox mode ignores this since sandboxes do not affect policy.'
+    required: false
+    default: 'true'
+  fail_workflow_on_error:
+    description: 'If true, infrastructure errors fail the step. If false, errors set scan_failed=true but exit 0.'
+    required: false
+    default: 'true'
+
+  # ---- endpoint ----
+  veracode_host:
+    description: 'Veracode hostname (default analysiscenter.veracode.com — the allowlisted host)'
+    required: false
+    default: 'analysiscenter.veracode.com'
+
+outputs:
+  scan_mode:
+    description: 'Echoes the scan mode that ran'
+    value: ${{ inputs.scan_mode }}
+  scan_failed:
+    description: 'true if scan could not complete due to infrastructure error'
+    value: ${{ steps.run.outputs.scan_failed }}
+  policy_violation:
+    description: 'true if policy mode scan completed but did not pass policy'
+    value: ${{ steps.run.outputs.policy_violation }}
+  policy_compliance_status:
+    description: 'Veracode policy compliance status (Pass / Did Not Pass / Conditional Pass)'
+    value: ${{ steps.run.outputs.policy_compliance_status }}
+  flaws_not_passing_policy:
+    description: 'Number of flaws not passing policy'
+    value: ${{ steps.run.outputs.flaws_not_passing_policy }}
+  build_id:
+    description: 'Veracode build ID'
+    value: ${{ steps.run.outputs.build_id }}
+  jar_filename:
+    description: 'Original filename of the wrapper JAR as served by Nexus'
+    value: ${{ steps.download.outputs.jar_filename }}
+  jar_path:
+    description: 'Absolute path of the downloaded wrapper JAR on the runner'
+    value: ${{ steps.download.outputs.jar_path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "${{ inputs.scan_mode }}" in
+          sandbox|policy) ;;
+          pipeline)
+            echo "::error::Pipeline scan is not supported by the Java API wrapper. Use the pipeline-scan composite instead."
+            exit 1
+            ;;
+          *)
+            echo "::error::scan_mode must be one of: sandbox, policy (got '${{ inputs.scan_mode }}')"
+            exit 1
+            ;;
+        esac
+        if [[ ! -f "${{ inputs.artifact_path }}" ]]; then
+          echo "::error::Artifact not found: ${{ inputs.artifact_path }}"
+          exit 1
+        fi
+        if [[ "${{ inputs.scan_mode }}" == "sandbox" && -z "${{ inputs.sandbox_name }}" ]]; then
+          echo "::error::sandbox_name is required when scan_mode=sandbox"
+          exit 1
+        fi
+        echo "Mode:        ${{ inputs.scan_mode }}"
+        echo "Application: ${{ inputs.app_name }}"
+        [[ "${{ inputs.scan_mode }}" == "sandbox" ]] && echo "Sandbox:     ${{ inputs.sandbox_name }}"
+        echo "Endpoint:    ${{ inputs.veracode_host }}"
+
+    - name: Ensure wget is available
+      shell: bash
+      run: |
+        if ! command -v wget >/dev/null 2>&1; then
+          echo "wget not found, installing..."
+          if   command -v apt-get >/dev/null; then sudo apt-get update -qq && sudo apt-get install -y -qq wget
+          elif command -v yum     >/dev/null; then sudo yum install -y -q wget
+          elif command -v dnf     >/dev/null; then sudo dnf install -y -q wget
+          else
+            echo "::error::No package manager found and wget missing"
+            exit 1
+          fi
+        fi
+        wget --version | head -1
+
+    - name: Download wrapper JAR from Nexus
+      id: download
+      shell: bash
+      env:
+        NEXUS_USER: ${{ inputs.nexus_user }}
+        NEXUS_PASSWORD: ${{ inputs.nexus_password }}
+      run: |
+        set -euo pipefail
+        URL="${{ inputs.nexus_url }}/repository/${{ inputs.nexus_repo }}/${{ inputs.nexus_jar_path }}"
+        DOWNLOAD_DIR="$RUNNER_TEMP/veracode-wrapper-download"
+
+        # Clean directory so we can reliably identify the downloaded file
+        rm -rf "$DOWNLOAD_DIR"
+        mkdir -p "$DOWNLOAD_DIR"
+        cd "$DOWNLOAD_DIR"
+
+        echo "Downloading from: $URL"
+
+        # --content-disposition + --trust-server-names preserves the server filename.
+        # Do NOT use -O: it overrides Content-Disposition.
+        wget \
+          --content-disposition \
+          --trust-server-names \
+          --user="$NEXUS_USER" \
+          --password="$NEXUS_PASSWORD" \
+          --tries=3 \
+          --timeout=60 \
+          --no-verbose \
+          "$URL"
+
+        # Identify what we got — directory has exactly one file
+        shopt -s nullglob
+        FILES=( "$DOWNLOAD_DIR"/* )
+        if [[ ${#FILES[@]} -ne 1 ]]; then
+          echo "::error::Expected exactly 1 downloaded file, got ${#FILES[@]}"
+          ls -la "$DOWNLOAD_DIR"
+          exit 1
+        fi
+        JAR_PATH="${FILES[0]}"
+        JAR_FILENAME="$(basename "$JAR_PATH")"
+        SIZE=$(stat -c%s "$JAR_PATH" 2>/dev/null || stat -f%z "$JAR_PATH")
+
+        echo "Downloaded: $JAR_FILENAME ($SIZE bytes)"
+
+        # ---- validate before passing downstream ----
+
+        # Size sanity (wrapper is several MB)
+        if [[ $SIZE -lt 100000 ]]; then
+          echo "::error::JAR too small ($SIZE bytes) — likely an error page or empty response"
+          head -c 500 "$JAR_PATH" || true
+          exit 1
+        fi
+
+        # Magic bytes — JAR is a zip, must start with PK
+        MAGIC=$(xxd -l 4 -p "$JAR_PATH")
+        if [[ "$MAGIC" != "504b0304" ]]; then
+          echo "::error::Not a valid jar/zip (magic: $MAGIC, expected 504b0304)"
+          file "$JAR_PATH"
+          exit 1
+        fi
+
+        # Make sure the runner can read it
+        chmod 644 "$JAR_PATH"
+
+        # Manifest + Main-Class — proves it's executable
+        if ! unzip -p "$JAR_PATH" META-INF/MANIFEST.MF 2>/dev/null | grep -q '^Main-Class:'; then
+          echo "::error::JAR has no Main-Class — not an executable JAR"
+          unzip -p "$JAR_PATH" META-INF/MANIFEST.MF 2>&1 | head -20
+          exit 1
+        fi
+
+        # Verify against Nexus-stored sha1 if available (round-trip integrity)
+        EXPECTED_SHA1=$(curl -sS -u "$NEXUS_USER:$NEXUS_PASSWORD" "${URL}.sha1" 2>/dev/null || echo "")
+        if [[ -n "$EXPECTED_SHA1" && ${#EXPECTED_SHA1} -eq 40 ]]; then
+          ACTUAL_SHA1=$(sha1sum "$JAR_PATH" | awk '{print $1}')
+          if [[ "$ACTUAL_SHA1" != "$EXPECTED_SHA1" ]]; then
+            echo "::error::SHA1 mismatch — Nexus stored=$EXPECTED_SHA1, downloaded=$ACTUAL_SHA1"
+            exit 1
+          fi
+          echo "SHA1 verified against Nexus: $ACTUAL_SHA1"
+        else
+          echo "::warning::No .sha1 sidecar in Nexus; skipping checksum verification"
+        fi
+
+        # Surface to downstream steps
+        echo "jar_path=$JAR_PATH"         >> "$GITHUB_OUTPUT"
+        echo "jar_filename=$JAR_FILENAME" >> "$GITHUB_OUTPUT"
+        echo "jar_size=$SIZE"             >> "$GITHUB_OUTPUT"
+
+        {
+          echo "## Wrapper JAR download"
+          echo "| Field | Value |"
+          echo "|---|---|"
+          echo "| Filename | \`$JAR_FILENAME\` |"
+          echo "| Size | $SIZE bytes |"
+          echo "| Path | \`$JAR_PATH\` |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Run scan
+      id: run
+      shell: bash
+      env:
+        VID:   ${{ inputs.veracode_api_id }}
+        VKEY:  ${{ inputs.veracode_api_key }}
+        VHOST: ${{ inputs.veracode_host }}
+        WRAPPER: ${{ steps.download.outputs.jar_path }}
+      run: |
+        set +e
+        SCAN_FAILED=false
+        POLICY_VIOLATION=false
+        POLICY_STATUS=""
+        FLAWS_NOT_PASSING=0
+        BUILD_ID=""
+        MODE="${{ inputs.scan_mode }}"
+        OUTPUT_LOG="$RUNNER_TEMP/veracode-${MODE}-output.log"
+
+        # Pin endpoint via wrapper system property
+        JAVA_OPTS=( -Dveracode.wrapper.api.host="$VHOST" )
+
+        # Choose action
+        if [[ "${{ inputs.wait_for_scan }}" == "true" ]]; then
+          ACTION="uploadandscan"
+        else
+          ACTION="uploadfile"
+        fi
+
+        ARGS=(
+          "${JAVA_OPTS[@]}"
+          -jar "$WRAPPER"
+          -action "$ACTION"
+          -vid "$VID"
+          -vkey "$VKEY"
+          -appname "${{ inputs.app_name }}"
+          -version "${{ inputs.app_version }}"
+          -filepath "${{ inputs.artifact_path }}"
+        )
+
+        if [[ "${{ inputs.create_profile }}" == "true" ]]; then
+          ARGS+=( -createprofile true -criticality "${{ inputs.business_criticality }}" )
+          [[ -n "${{ inputs.teams }}" ]] && ARGS+=( -teams "${{ inputs.teams }}" )
+        else
+          ARGS+=( -createprofile false )
+        fi
+
+        if [[ "$MODE" == "sandbox" ]]; then
+          ARGS+=( -sandboxname "${{ inputs.sandbox_name }}" )
+          [[ "${{ inputs.create_sandbox }}" == "true" ]] && ARGS+=( -createsandbox true )
+        fi
+
+        if [[ "$ACTION" == "uploadandscan" ]]; then
+          ARGS+=(
+            -scanallnonfataltoplevelmodules "${{ inputs.scan_all_nonfatal_top_level_modules }}"
+            -includenewmodules "${{ inputs.include_new_modules }}"
+            -scantimeout "${{ inputs.scan_timeout_minutes }}"
+          )
+        fi
+
+        echo "::group::Wrapper invocation (key redacted)"
+        printf '%s ' "java"
+        for a in "${ARGS[@]}"; do
+          [[ "$a" == "$VKEY" ]] && printf '*** ' || printf '%q ' "$a"
+        done
+        echo
+        echo "::endgroup::"
+
+        java "${ARGS[@]}" 2>&1 | tee "$OUTPUT_LOG"
+        EXIT_CODE=${PIPESTATUS[0]}
+
+        # Parse wrapper output (XML-ish lines)
+        BUILD_ID=$(grep -oE 'build_id="[0-9]+"' "$OUTPUT_LOG" | head -1 | grep -oE '[0-9]+' || true)
+        POLICY_STATUS=$(grep -oE 'policy_compliance_status="[^"]+"' "$OUTPUT_LOG" | head -1 | sed 's/.*="//; s/"$//' || true)
+        FLAWS_NOT_PASSING=$(grep -oE 'flaws_not_passing_policy="[0-9]+"' "$OUTPUT_LOG" | head -1 | grep -oE '[0-9]+' || echo 0)
+
+        # Interpret outcome
+        if [[ "$ACTION" == "uploadfile" ]]; then
+          [[ $EXIT_CODE -ne 0 ]] && { SCAN_FAILED=true; echo "::error::uploadfile failed (exit $EXIT_CODE)"; }
+        else
+          if [[ -n "$POLICY_STATUS" ]]; then
+            case "$POLICY_STATUS" in
+              "Pass") : ;;
+              "Conditional Pass"|"Did Not Pass")
+                [[ "$MODE" == "policy" ]] && POLICY_VIOLATION=true ;;
+              *) echo "::warning::Unrecognized policy_compliance_status: '$POLICY_STATUS'" ;;
+            esac
+          else
+            SCAN_FAILED=true
+            echo "::error::${MODE^} scan did not produce a parseable result (exit $EXIT_CODE) — check connectivity to $VHOST"
+          fi
+        fi
+
+        # Job summary
+        {
+          echo "## Veracode ${MODE^} Scan"
+          echo "| Field | Value |"
+          echo "|---|---|"
+          echo "| Mode | $MODE |"
+          echo "| Action | $ACTION |"
+          echo "| Wrapper | \`${{ steps.download.outputs.jar_filename }}\` |"
+          echo "| Application | ${{ inputs.app_name }} |"
+          [[ "$MODE" == "sandbox" ]] && echo "| Sandbox | ${{ inputs.sandbox_name }} |"
+          echo "| Version | ${{ inputs.app_version }} |"
+          echo "| Endpoint | $VHOST |"
+          [[ -n "$BUILD_ID" ]]      && echo "| Build ID | $BUILD_ID |"
+          [[ -n "$POLICY_STATUS" ]] && echo "| Policy compliance | $POLICY_STATUS |"
+          echo "| Flaws not passing | $FLAWS_NOT_PASSING |"
+          echo "| Scan failed | $SCAN_FAILED |"
+          echo "| Policy violation | $POLICY_VIOLATION |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        echo "scan_failed=$SCAN_FAILED"                       >> "$GITHUB_OUTPUT"
+        echo "policy_violation=$POLICY_VIOLATION"             >> "$GITHUB_OUTPUT"
+        echo "policy_compliance_status=$POLICY_STATUS"        >> "$GITHUB_OUTPUT"
+        echo "flaws_not_passing_policy=$FLAWS_NOT_PASSING"    >> "$GITHUB_OUTPUT"
+        echo "build_id=$BUILD_ID"                             >> "$GITHUB_OUTPUT"
+
+        # Decoupled failure control
+        if [[ "$SCAN_FAILED" == "true" && "${{ inputs.fail_workflow_on_error }}" == "true" ]]; then
+          exit 1
+        fi
+        if [[ "$POLICY_VIOLATION" == "true" && "${{ inputs.fail_on_policy_violation }}" == "true" ]]; then
+          exit 1
+        fi
+        exit 0
+
+    - name: Upload wrapper log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: veracode-${{ inputs.scan_mode }}-${{ inputs.app_name }}
+        path: ${{ runner.temp }}/veracode-${{ inputs.scan_mode }}-output.log
+        if-no-files-found: warn
