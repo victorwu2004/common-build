@@ -1,0 +1,45 @@
+<br>
+
+Before I build this out, I need to flag something important about GitHub Copilot specifically, because it changes the design.
+
+GitHub Copilot does **not** offer a general-purpose public API you can call the way you call Anthropic or OpenAI. There's no official "send a prompt, get a completion" REST endpoint that GitHub supports for building your own apps. What exists:
+
+- **Copilot in your IDE** (autocomplete, chat) — not callable from a standalone Python script
+- **Copilot Extensions / Agents** — these let you build *into* the Copilot chat experience (the agent runs when a user `@mentions` it in Copilot Chat), not a way to call Copilot *from* your own app
+- **The internal completions endpoint** that the IDE plugins use — this is undocumented, requires reverse-engineering the auth token flow, and using it for your own app violates GitHub's terms of service
+
+So a clean "connect to the Copilot API and generate DB2 SQL" project, the way you'd do with Anthropic, isn't really something GitHub supports. Let me check the current state of things to make sure I'm not giving you stale information.
+
+My earlier caution is now outdated — GitHub shipped exactly the thing that didn't exist before. The **GitHub Copilot SDK** went into public preview on April 2, 2026, and it's purpose-built for what you're describing: it gives you programmatic access to Copilot's agentic engine — the same runtime that powers the Copilot CLI, exposed as a library you can import into your own code. [Microsoft Community Hub](https://techcommunity.microsoft.com/blog/microsoftmissioncriticalblog/getting-started-with-github-copilot-sdk/4510059) It supports Python, and crucially for a database agent, it lets you register regular Python functions as tools that the agent calls autonomously when it needs to interact with the outside world — query a database, hit an API, read a file. [Microsoft Community Hub](https://techcommunity.microsoft.com/blog/microsoftmissioncriticalblog/getting-started-with-github-copilot-sdk/4510059)
+
+That's a perfect fit for the DB2 use case: you register `get_schema` and `run_query` as tools, and Copilot's agent orchestrates the loop itself (read schema → draft SQL → run → self-correct on error).
+
+A few key facts that shape the project:
+
+- **How it works under the hood:** All SDKs communicate with the Copilot CLI via JSON-RPC — your app → SDK client → Copilot CLI running in server mode. The SDK manages the CLI process lifecycle automatically. [GitHub](https://github.com/github/copilot-sdk) For Python, the Copilot CLI is bundled automatically as a dependency, so you don't need to install it separately. [GitHub](https://github.com/github/copilot-sdk)
+- **Auth/billing:** Every prompt counts against your GitHub Copilot subscription's premium request quota. [Microsoft Community Hub](https://techcommunity.microsoft.com/blog/microsoftmissioncriticalblog/getting-started-with-github-copilot-sdk/4510059) Alternatively, it supports BYOK (Bring Your Own Key) — you can configure your own API keys from OpenAI, Microsoft Foundry, or Anthropic. [GitHub](https://github.com/github/copilot-sdk)
+- **Security, relevant to running SQL:** the permission handler lets you inspect each tool request by kind — shell, write, read, url, custom-tool — and return approved or denied per request. [Microsoft Community Hub](https://techcommunity.microsoft.com/blog/microsoftmissioncriticalblog/getting-started-with-github-copilot-sdk/4510059) This is your gate for read-only enforcement.
+- **Requirements:** Python 3.11 or higher, plus the Copilot CLI accessible in your PATH. [Microsoft Community Hub](https://techcommunity.microsoft.com/blog/microsoftmissioncriticalblog/getting-started-with-github-copilot-sdk/4510059)
+
+Let me grab the actual Python SDK API shape so the code I write matches the real interface rather than my guess at it.
+
+I have the install details. Let me pull the Python SDK README to get the exact API (client init, session creation, tool registration, permission handler) so the code is correct rather than guessed.
+
+I now have the real SDK API. Let me build the project. The architecture is clean: register `get_schema` and `run_query` as Copilot SDK tools, use the permission handler as your read-only safety gate, and let Copilot's agent orchestrate the loop. I'll lay it out as a proper project with multiple files.
+
+Now let me verify the code at least parses and write the README.
+
+Done. Good news: the thing I cautioned against earlier ("Copilot has no general API") is now outdated — GitHub shipped the **Copilot SDK** to public preview on April 2, 2026, and it's exactly the right tool here. It exposes the same agent runtime behind the Copilot CLI as an importable Python library, and lets you register your own Python functions as tools the agent calls autonomously. So I built the project around it.
+
+**How it works:** instead of single-shot SQL generation, you register two tools — `get_schema` and `run_query` — and Copilot's agent runs the loop itself: read schema → write read-only DB2 SQL → execute → self-correct on errors → summarize. That's the agentic version of the DB2 design from earlier in our conversation.
+
+**Two safety layers**, which matters since this executes SQL:
+- The SDK's `on_permission_request` handler fires before every tool call. Mine denies shell/write/url tools outright and re-validates each `run_query` SQL string as read-only before approving — a model-independent gate.
+- The real guarantee, as always: connect with a **read-only DB2 account**. Code filters are bypassable; database grants aren't.
+
+**Key facts for your setup:**
+- Needs Python 3.11+ and a **Copilot subscription** (each prompt hits your premium request quota), or **BYOK** with your own OpenAI/Anthropic/Foundry key — the latter is the one to look at for keeping traffic on approved/in-network model endpoints.
+- The Copilot CLI is bundled with the Python SDK, no separate install.
+- The catalog queries in `db2.py` are DB2 LUW (`SYSCAT.*`); the README has the z/OS and DB2-for-i swaps.
+
+Two things worth deciding given your environment: which **auth path** (Copilot seat vs. BYOK) — relevant because schema metadata and result rows go to the model, so BYOK with an approved endpoint may matter for data policy. And which **DB2 platform** you're on, so I can lock in the right catalog views. Tell me both and I'll tailor it. The SDK is still public preview, so pin the version.
