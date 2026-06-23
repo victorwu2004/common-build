@@ -1,0 +1,25 @@
+Here's how the logic works across the three modes:
+
+---
+
+### Mode decision table
+
+| `solution_file` | `project_file` | `restore` target | `build` target |
+|:-:|:-:|---|---|
+| ✅ | ❌ | solution | solution |
+| ❌ | ✅ | project | project |
+| ✅ | ✅ | solution | project only |
+
+The mode is resolved in a single PowerShell `resolve` step, which writes `build_mode`, `restore_target`, and `build_target` to `$GITHUB_OUTPUT`. Every subsequent step reads from those outputs — meaning the logic runs once and everything downstream is deterministic.
+
+---
+
+### Key design decisions
+
+**Separate `if:` restore steps instead of one step with an `if/else`** — GitHub Actions doesn't support runtime branching inside a single step cleanly. Three explicitly named steps give you clear, labeled entries in the Actions UI so you can see exactly what ran and against what file.
+
+**`--no-restore` on `dotnet build`** — restore always runs first as its own step, so build gets `--no-restore` in all three modes. This avoids a silent double-restore and makes the log output cleaner.
+
+**File existence check before any dotnet command** — a bad path passed by a caller fails fast with a clear message before wasting time on SDK setup or restore.
+
+**`build_mode` as a job output** — downstream jobs (like the deploy in the caller example) can branch on `solution-only` vs `solution-restore-project-build` if they need to handle artifacts differently.
