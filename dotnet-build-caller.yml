@@ -1,0 +1,77 @@
+name: CI – Build Examples
+
+# ============================================================
+# Caller examples showing all three dotnet-build.yml modes.
+# In practice you would only use one of the three jobs below.
+# ============================================================
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+
+  # ----------------------------------------------------------
+  # Mode 1: Solution file only
+  # → nuget restore (solution) → dotnet build (solution)
+  # ----------------------------------------------------------
+  build-solution-only:
+    name: Build (solution only)
+    uses: ./.github/workflows/dotnet-build.yml
+    with:
+      solution_file: MyApp.sln
+      configuration: Release
+      dotnet_version: '8.0.x'
+
+  # ----------------------------------------------------------
+  # Mode 2: Project file only
+  # → nuget restore (project) → dotnet build (project)
+  # ----------------------------------------------------------
+  build-project-only:
+    name: Build (project only)
+    uses: ./.github/workflows/dotnet-build.yml
+    with:
+      project_file: src/MyApp.Api/MyApp.Api.csproj
+      configuration: Release
+      dotnet_version: '8.0.x'
+      output_directory: publish/api
+      upload_artifacts: true
+
+  # ----------------------------------------------------------
+  # Mode 3: Both — restore at solution, build the project
+  # → nuget restore (solution) → dotnet build (project only)
+  # ----------------------------------------------------------
+  build-solution-restore-project-build:
+    name: Build (solution restore + project build)
+    uses: ./.github/workflows/dotnet-build.yml
+    with:
+      solution_file:  MyApp.sln
+      project_file:   src/MyApp.Api/MyApp.Api.csproj
+      configuration:  Release
+      dotnet_version: '8.0.x'
+      output_directory: publish/api
+      upload_artifacts: true
+      build_args: '/p:TreatWarningsAsErrors=true'
+
+  # ----------------------------------------------------------
+  # Downstream job — consumes build outputs
+  # ----------------------------------------------------------
+  deploy:
+    name: Deploy
+    needs: [build-solution-restore-project-build]
+    runs-on: [self-hosted, windows]
+    steps:
+      - name: Show build outputs from reusable workflow
+        shell: pwsh
+        run: |
+          Write-Host "Build mode    : ${{ needs.build-solution-restore-project-build.outputs.build_mode }}"
+          Write-Host "Build target  : ${{ needs.build-solution-restore-project-build.outputs.build_target }}"
+          Write-Host "Restore target: ${{ needs.build-solution-restore-project-build.outputs.restore_target }}"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: downloaded-build
