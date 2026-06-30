@@ -1,0 +1,93 @@
+---
+# cleanup_old_tmp.yml
+# Removes temp/leftover files older than 6 months (180 days) from common
+# Ansible and system temp locations. Safe-by-default: dry-run unless
+# -e confirm=true is passed.
+#
+# Usage:
+#   Dry run (lists what WOULD be removed):
+#     ansible-playbook cleanup_old_tmp.yml -i inventory
+#   Actually delete:
+#     ansible-playbook cleanup_old_tmp.yml -i inventory -e confirm=true
+
+- name: Clean up temp files older than 6 months
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    age: "180d"                      # 6 months
+    confirm: false                   # set true to actually delete
+    tmp_dirs:
+      - /tmp
+      - /var/tmp
+    ansible_tmp_globs:
+      - /root/.ansible/tmp
+      - /home/*/.ansible/tmp
+
+  tasks:
+    - name: Find old files in temp directories
+      ansible.builtin.find:
+        paths: "{{ tmp_dirs }}"
+        age: "{{ age }}"
+        age_stamp: mtime
+        recurse: true
+        file_type: any
+        hidden: true
+      register: old_tmp_files
+
+    - name: Find leftover ansible-tmp-* dirs older than 6 months
+      ansible.builtin.find:
+        paths: "{{ ansible_tmp_globs }}"
+        patterns: "ansible-tmp-*"
+        age: "{{ age }}"
+        age_stamp: mtime
+        recurse: false
+        file_type: directory
+      register: old_ansible_tmp
+      # find module does not expand globs in 'paths'; resolve shell-style below
+      when: false
+
+    - name: Resolve ansible tmp dirs (glob expansion)
+      ansible.builtin.shell: >
+        find /root/.ansible/tmp /home/*/.ansible/tmp -maxdepth 1
+        -type d -name 'ansible-tmp-*' -mtime +180 2>/dev/null || true
+      register: ansible_tmp_resolved
+      changed_when: false
+      check_mode: false
+
+    - name: Report what would be removed (dry run)
+      ansible.builtin.debug:
+        msg: >-
+          [{{ inventory_hostname }}] Would remove
+          {{ old_tmp_files.files | length }} tmp file(s) and
+          {{ ansible_tmp_resolved.stdout_lines | length }} ansible-tmp dir(s).
+      when: not confirm | bool
+
+    - name: Remove old temp files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_tmp_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: confirm | bool
+
+    - name: Remove old ansible-tmp-* directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ ansible_tmp_resolved.stdout_lines }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - confirm | bool
+        - item | length > 0
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          [{{ inventory_hostname }}] Removed
+          {{ old_tmp_files.files | length }} file(s) and
+          {{ ansible_tmp_resolved.stdout_lines | length }} ansible-tmp dir(s).
+      when: confirm | bool
