@@ -1,0 +1,4 @@
+# No external dependencies for hello world!
+# But we keep this file for good practice - add packages here later:
+# requests>=2.31.0
+# flask>=3.0.0

@@ -1,0 +1,42 @@
+# Don't include these files in the container image
+# Keeps the image smaller and more secure
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Documentation
+README.md
+*.md
+docs/
+
+# Test files
+tests/
+test_*.py
+
+# Local config
+.env
+*.log

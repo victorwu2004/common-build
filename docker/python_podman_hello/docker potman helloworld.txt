@@ -1,0 +1,131 @@
+Perfect for learning! Let me build a simple hello world app with everything you need to run it in Podman.Now let's verify everything works by actually testing the Python code:The app works. Now let's package everything:Done! I built and tested a complete containerized Python hello world app.
+
+## What's Included
+
+| File | Purpose |
+|------|---------|
+| `app.py` | Python hello world with env vars & loop |
+| `Dockerfile` | Container image definition |
+| `requirements.txt` | Python dependencies |
+| `.dockerignore` | Files to exclude from image |
+| `podman-compose.yml` | Optional compose file |
+| `run.sh` / `run.bat` | One-command build+run scripts |
+| `README.md` | Complete guide with commands |
+
+## Quick Start
+
+### Step 1: Install Podman
+
+```bash
+# Linux (Fedora/RHEL)
+sudo dnf install podman
+
+# Linux (Ubuntu)
+sudo apt install podman
+
+# macOS
+brew install podman
+podman machine init
+podman machine start
+
+# Windows: https://podman.io/getting-started/installation
+```
+
+### Step 2: Extract and Run
+
+```bash
+unzip python_podman_hello.zip
+cd python_podman_hello
+
+# Linux/Mac
+./run.sh
+
+# Windows
+run.bat
+```
+
+That's it! The script will:
+1. Build the container image
+2. Clean up old containers  
+3. Run the app with pretty output
+
+## What You'll See
+
+```
+============================================================
+  🐍 Python Hello World in Container
+============================================================
+  Python version:  3.12.3
+  Container host:  abc123def456
+  Started at:      2026-07-04 19:41:00
+  Message:         Running in Podman rootless container!
+  Greeting for:    Podman User
+  Loop interval:   3 seconds
+============================================================
+
+[19:41:00] Hello, Podman User! (message #1)
+[19:41:03] Hello, Podman User! (message #2)
+[19:41:06] Hello, Podman User! (message #3)
+```
+
+Press **Ctrl+C** to stop.
+
+## Manual Commands (If You Want to Learn)
+
+```bash
+# Build image
+podman build -t python-hello .
+
+# Run with defaults
+podman run --rm python-hello
+
+# Run with custom env vars
+podman run --rm \
+  -e NAME="Alice" \
+  -e INTERVAL="2" \
+  -e MESSAGE="My container works!" \
+  python-hello
+
+# List images
+podman images
+
+# List running containers
+podman ps
+
+# Follow logs of running container
+podman logs -f hello-container
+```
+
+## What Makes This a Good Learning Example
+
+1. **Non-root user** — Security best practice (line 25 in Dockerfile)
+2. **Layer caching** — `requirements.txt` copied before code (rebuilds faster)
+3. **Environment variables** — Configure without rebuilding
+4. **`.dockerignore`** — Keeps image small & secure
+5. **Graceful shutdown** — Handles Ctrl+C properly (signal_handler)
+6. **`PYTHONUNBUFFERED=1`** — Real-time log output
+
+## Docker Compatibility
+
+The same Dockerfile works with Docker! Just swap the command:
+
+```bash
+docker build -t python-hello .
+docker run --rm python-hello
+```
+
+Podman is a drop-in replacement for Docker with these benefits:
+- **No daemon** — More secure (no root process)
+- **Rootless by default** — Runs without sudo
+- **Same commands** — All Docker knowledge transfers
+
+## Next Steps
+
+Once this works, level up:
+
+1. **Add Flask** — Turn it into a web API
+2. **Add a database** — Postgres via podman-compose  
+3. **Multi-stage builds** — Even smaller images
+4. **Push to registry** — Share your image on Docker Hub
+
+Extract the zip and try it! Let me know if you hit any issues.

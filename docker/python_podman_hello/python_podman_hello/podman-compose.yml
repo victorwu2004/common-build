@@ -1,0 +1,19 @@
+# Podman Compose file (works with docker-compose too!)
+# Usage: podman-compose up
+# Or:    docker-compose up
+
+version: '3.8'
+
+services:
+  hello:
+    build: .
+    image: python-hello:latest
+    container_name: hello-container
+    environment:
+      - NAME=Compose User
+      - INTERVAL=3
+      - MESSAGE=Hello from podman-compose!
+    restart: unless-stopped
+    # If you want to see logs in real-time
+    tty: true
+    stdin_open: true
