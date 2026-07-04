@@ -1,0 +1,304 @@
+name: .NET Build
+
+# ============================================================
+# Reusable Workflow: dotnet-build.yml
+#
+# Three supported input combinations:
+#
+#  ┌─────────────────────────┬──────────────────────────────────────────┐
+#  │ Inputs provided         │ Behaviour                                │
+#  ├─────────────────────────┼──────────────────────────────────────────┤
+#  │ solution_file only      │ nuget restore (solution) → build (sln)   │
+#  │ project_file only       │ nuget restore (project)  → build (csproj)│
+#  │ solution + project_file │ nuget restore (solution) → build (csproj)│
+#  └─────────────────────────┴──────────────────────────────────────────┘
+#
+# Caller example:
+#   uses: ./.github/workflows/dotnet-build.yml
+#   with:
+#     solution_file: MyApp.sln
+#     project_file:  src/MyApp.Api/MyApp.Api.csproj
+#   secrets: inherit
+# ============================================================
+
+on:
+  workflow_call:
+    inputs:
+
+      solution_file:
+        description: >
+          Relative path to the .sln file from the repo root.
+          Required when restoring at solution level.
+          Example: MyApp.sln
+        required: false
+        type: string
+        default: ''
+
+      project_file:
+        description: >
+          Relative path to the .csproj (or .vbproj / .fsproj) from the repo root.
+          When provided, only this project is built.
+          Example: src/MyApp.Api/MyApp.Api.csproj
+        required: false
+        type: string
+        default: ''
+
+      configuration:
+        description: Build configuration — Release or Debug.
+        required: false
+        type: string
+        default: Release
+
+      dotnet_version:
+        description: >
+          .NET SDK version to use. Supports SemVer ranges.
+          Example: '8.0.x'
+        required: false
+        type: string
+        default: '8.0.x'
+
+      build_args:
+        description: >
+          Extra MSBuild/dotnet build arguments appended verbatim.
+          Example: '/p:TreatWarningsAsErrors=true'
+        required: false
+        type: string
+        default: ''
+
+      output_directory:
+        description: >
+          Directory where build outputs are placed (--output flag).
+          Relative to repo root. Leave empty to use dotnet defaults.
+        required: false
+        type: string
+        default: ''
+
+      upload_artifacts:
+        description: >
+          When true, uploads the build output directory as a
+          GitHub Actions artifact named 'build-output'.
+        required: false
+        type: boolean
+        default: false
+
+      artifact_retention_days:
+        description: Number of days to retain uploaded build artifacts.
+        required: false
+        type: number
+        default: 7
+
+      runs_on:
+        description: >
+          Runner label(s) as a JSON array string.
+          Example: '["self-hosted","windows"]'
+        required: false
+        type: string
+        default: '["self-hosted","windows"]'
+
+    outputs:
+      build_mode:
+        description: >
+          Which build mode was executed:
+          solution-only | project-only | solution-restore-project-build
+        value: ${{ jobs.build.outputs.build_mode }}
+
+      build_target:
+        description: The file path that was passed to dotnet build.
+        value: ${{ jobs.build.outputs.build_target }}
+
+      restore_target:
+        description: The file path that was passed to dotnet restore.
+        value: ${{ jobs.build.outputs.restore_target }}
+
+# ============================================================
+jobs:
+  build:
+    name: .NET Build
+    runs-on: ${{ fromJson(inputs.runs_on) }}
+
+    outputs:
+      build_mode:    ${{ steps.resolve.outputs.build_mode }}
+      build_target:  ${{ steps.resolve.outputs.build_target }}
+      restore_target: ${{ steps.resolve.outputs.restore_target }}
+
+    steps:
+      # --------------------------------------------------------
+      # Step 1 — Validate inputs and resolve build mode
+      # --------------------------------------------------------
+      - name: Resolve build mode
+        id: resolve
+        shell: pwsh
+        run: |
+          $sln  = "${{ inputs.solution_file }}".Trim()
+          $proj = "${{ inputs.project_file }}".Trim()
+
+          $hasSln  = $sln  -ne ''
+          $hasProj = $proj -ne ''
+
+          if (-not $hasSln -and -not $hasProj) {
+            Write-Error "At least one of solution_file or project_file must be provided."
+            exit 1
+          }
+
+          # ── Determine mode ────────────────────────────────────
+          if ($hasSln -and -not $hasProj) {
+            $mode          = "solution-only"
+            $restoreTarget = $sln
+            $buildTarget   = $sln
+          }
+          elseif ($hasProj -and -not $hasSln) {
+            $mode          = "project-only"
+            $restoreTarget = $proj
+            $buildTarget   = $proj
+          }
+          else {
+            # Both supplied: restore at solution level, build the project
+            $mode          = "solution-restore-project-build"
+            $restoreTarget = $sln
+            $buildTarget   = $proj
+          }
+
+          Write-Host "──────────────────────────────────────"
+          Write-Host "Build mode     : $mode"
+          Write-Host "Restore target : $restoreTarget"
+          Write-Host "Build target   : $buildTarget"
+          Write-Host "──────────────────────────────────────"
+
+          "build_mode=$mode"       | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "restore_target=$restoreTarget" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "build_target=$buildTarget"     | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      # --------------------------------------------------------
+      # Step 2 — Checkout
+      # --------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # Step 3 — Setup .NET SDK
+      # --------------------------------------------------------
+      - name: Setup .NET SDK ${{ inputs.dotnet_version }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet_version }}
+
+      # --------------------------------------------------------
+      # Step 4 — Verify that the resolved target files exist
+      # --------------------------------------------------------
+      - name: Verify target files exist
+        shell: pwsh
+        run: |
+          $restoreTarget = "${{ steps.resolve.outputs.restore_target }}"
+          $buildTarget   = "${{ steps.resolve.outputs.build_target }}"
+
+          foreach ($file in @($restoreTarget, $buildTarget) | Select-Object -Unique) {
+            if (-not (Test-Path $file)) {
+              Write-Error "File not found: '$file'. Check the path passed to this workflow."
+              exit 1
+            }
+            Write-Host "Found: $file"
+          }
+
+      # --------------------------------------------------------
+      # Step 5a — NuGet restore (solution-only mode)
+      # --------------------------------------------------------
+      - name: "NuGet restore – solution: ${{ steps.resolve.outputs.restore_target }}"
+        if: steps.resolve.outputs.build_mode == 'solution-only'
+        shell: pwsh
+        run: |
+          dotnet restore "${{ steps.resolve.outputs.restore_target }}" `
+            --verbosity minimal
+
+      # --------------------------------------------------------
+      # Step 5b — NuGet restore (project-only mode)
+      # --------------------------------------------------------
+      - name: "NuGet restore – project: ${{ steps.resolve.outputs.restore_target }}"
+        if: steps.resolve.outputs.build_mode == 'project-only'
+        shell: pwsh
+        run: |
+          dotnet restore "${{ steps.resolve.outputs.restore_target }}" `
+            --verbosity minimal
+
+      # --------------------------------------------------------
+      # Step 5c — NuGet restore at solution level
+      #           (solution-restore-project-build mode)
+      # --------------------------------------------------------
+      - name: "NuGet restore – solution: ${{ steps.resolve.outputs.restore_target }}"
+        if: steps.resolve.outputs.build_mode == 'solution-restore-project-build'
+        shell: pwsh
+        run: |
+          dotnet restore "${{ steps.resolve.outputs.restore_target }}" `
+            --verbosity minimal
+
+      # --------------------------------------------------------
+      # Step 6 — Build
+      # All three modes converge here — only the target differs.
+      # --no-restore because restore already ran above.
+      # --------------------------------------------------------
+      - name: "dotnet build – ${{ steps.resolve.outputs.build_mode }}"
+        id: dotnet-build
+        shell: pwsh
+        run: |
+          $buildTarget   = "${{ steps.resolve.outputs.build_target }}"
+          $configuration = "${{ inputs.configuration }}"
+          $extraArgs     = "${{ inputs.build_args }}".Trim()
+          $outputDir     = "${{ inputs.output_directory }}".Trim()
+
+          $cmd = "dotnet build `"$buildTarget`" " +
+                 "--configuration $configuration " +
+                 "--no-restore "
+
+          if ($outputDir -ne '') {
+            $cmd += "--output `"$outputDir`" "
+          }
+
+          if ($extraArgs -ne '') {
+            $cmd += "$extraArgs"
+          }
+
+          Write-Host "Running: $cmd"
+          Invoke-Expression $cmd
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "dotnet build failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+
+      # --------------------------------------------------------
+      # Step 7 — Upload build output (optional)
+      # --------------------------------------------------------
+      - name: Upload build artifacts
+        if: ${{ inputs.upload_artifacts == true && inputs.output_directory != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: ${{ inputs.output_directory }}
+          retention-days: ${{ inputs.artifact_retention_days }}
+
+      # --------------------------------------------------------
+      # Step 8 — Summary
+      # --------------------------------------------------------
+      - name: Build summary
+        if: always()
+        shell: pwsh
+        run: |
+          $mode    = "${{ steps.resolve.outputs.build_mode }}"
+          $restore = "${{ steps.resolve.outputs.restore_target }}"
+          $build   = "${{ steps.resolve.outputs.build_target }}"
+          $config  = "${{ inputs.configuration }}"
+          $outcome = "${{ steps.dotnet-build.outcome }}"
+          $status  = if ($outcome -eq 'success') { '✅ Success' } else { '❌ Failed' }
+
+          $summary = @"
+          ### .NET Build Summary
+
+          | Field           | Value |
+          | --------------- | ----- |
+          | Build mode      | ``$mode`` |
+          | Restore target  | ``$restore`` |
+          | Build target    | ``$build`` |
+          | Configuration   | ``$config`` |
+          | Result          | $status |
+          "@
+
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

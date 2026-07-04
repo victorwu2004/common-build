@@ -142,45 +142,6 @@ runs:
         echo "Resolved jar: ${jar}"
         echo "jar=${jar}" >> "${GITHUB_OUTPUT}"
 
-    - name: Pre-flight check (artifact + proxy reachability to api.veracode.com)
-      shell: bash
-      env:
-        FILE: ${{ inputs.file }}
-        PROXY_HOST: ${{ inputs.proxy-host }}
-        PROXY_PORT: ${{ inputs.proxy-port }}
-        PROXY_USER: ${{ inputs.proxy-user }}
-        PROXY_PASS: ${{ inputs.proxy-password }}
-      run: |
-        set -uo pipefail
-
-        # 1. Artifact must exist before we bother scanning.
-        if [[ ! -f "${FILE}" ]]; then
-          echo "::error::Artifact not found: ${FILE}"
-          exit 1
-        fi
-
-        # 2. Confirm the SAME path the scan uses can reach api.veracode.com.
-        # healthcheck/status is unauthenticated, so any HTTP status proves the
-        # path is open. This catches the connectivity cause of exit 255 in
-        # seconds instead of after a 30-minute scan timeout.
-        curl_args=(-sS -o /dev/null -w '%{http_code}' --max-time 30)
-        if [[ -n "${PROXY_HOST}" ]]; then
-          curl_args+=(-x "http://${PROXY_HOST}:${PROXY_PORT}")
-          [[ -n "${PROXY_USER}" ]] && curl_args+=(--proxy-user "${PROXY_USER}:${PROXY_PASS}")
-        else
-          echo "::warning::No proxy-host set; testing DIRECT to api.veracode.com."
-        fi
-
-        echo "Checking https://api.veracode.com/healthcheck/status ..."
-        status="$(curl "${curl_args[@]}" https://api.veracode.com/healthcheck/status || echo 000)"
-        echo "HTTP ${status}"
-
-        if [[ "${status}" == "000" ]]; then
-          echo "::error::Could not reach api.veracode.com. Either the proxy is not carrying the request (connection timeout) or TLS interception failed (curl needs the Zscaler root CA in the system trust store). The scan would exit 255 here — fix the path first."
-          exit 1
-        fi
-        echo "Path to api.veracode.com is open (HTTP ${status}). Proceeding to scan."
-
     - name: Run Veracode Pipeline Scan
       id: scan
       shell: bash
