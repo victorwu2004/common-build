@@ -1,0 +1,64 @@
+Let me read your workflow carefully before making any changes.
+
+Good. Now I have both workflows fully in view. Here's my plan before touching anything:
+
+**What stays exactly as-is** (your naming, structure, logic, all steps): everything. No renaming, no restructuring.
+
+**The only changes needed:**
+1. Replace `MSBuildSolution` (glob `**/*.sln`) with two independent inputs: `MSBuildSolution` (solution file) and `MSBuildProject` (project file)
+2. Replace the `buildvariables` step's single `buildTarget` resolution with the two-rule logic: restore → solution wins, build → project wins
+3. The `Run NuGet Restore` step already uses `FOR /R %%i IN (*.sln)` — when project-only mode, switch it to restore the specific project path instead
+4. The `"Build, Pack, Publish, Zip"` step reads `$env:MSBUILD_SOLUTION` — it already handles both `.sln` and `.csproj` via `$isSolution`/`$isProject`, so just feed it `MSBUILD_BUILD_TARGET` (the resolved build target) and `MSBUILD_RESTORE_TARGET` separately
+
+Here's a precise summary of every change made — nothing else was touched:
+
+---
+
+### What changed
+
+**1. New input `MSBuildProject` added** (alongside the existing `MSBuildSolution`)
+```yaml
+MSBuildProject:
+  description: Path or glob to a specific .csproj / .vbproj / .fsproj
+  required: false
+  type: string
+  default: ''
+```
+`MSBuildSolution` keeps its existing name, description, and default (`**/*.sln`).
+
+---
+
+**2. `Build Variables` step — target resolution replaced**
+
+The old step resolved a single `$buildTarget` from `MSBuildSolution`. The new logic applies the two independent rules and exports two separate env vars:
+
+| Env var | Rule |
+|---|---|
+| `MSBUILD_RESTORE_TARGET` | Solution wins if provided, else project |
+| `MSBUILD_BUILD_TARGET` | Project wins if provided, else solution |
+| `MSBUILD_BUILD_MODE` | Human-readable label for logs/summary |
+
+The `Directory.Build.props` injection block now uses `$restoreTarget` instead of `$buildTarget` as the root for project discovery — correct because the solution is what defines the project graph.
+
+---
+
+**3. `Run NuGet Restore` step — switched from `cmd` to `pwsh`**
+
+The original used `FOR /R %%i IN (*.sln)` which always globbed for `.sln` files — it would miss a project-only restore. The replacement reads `$env:MSBUILD_RESTORE_TARGET` directly and calls `nuget.exe restore` against whichever file was resolved (solution or project), with the same `NuGetGHE.Config`.
+
+---
+
+**4. `"Build, Pack, Publish, Zip"` step — reads the two new env vars**
+
+Replaced the single `$buildTarget = $env:MSBUILD_SOLUTION` with:
+```powershell
+$buildTarget   = $env:MSBUILD_BUILD_TARGET    # what MSBuild compiles
+$restoreTarget = $env:MSBUILD_RESTORE_TARGET  # informational/logged
+```
+All downstream logic (`$isSolution`, `$isProject`, project list walk, phases 1–6) is unchanged.
+
+---
+
+**5. `Build Summary` step — two additional rows added**
+
+Added `Build Mode` and `Restore Target` / `Build Target` rows, and fixed the existing broken reference (`${{ steps.createzipfile.outputs.nexus_url }}` → `${{ steps.publishtonexus.outputs.nexus_url }}`).
