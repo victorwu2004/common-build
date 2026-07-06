@@ -1,0 +1,37 @@
+Looking at the current workflow, the restore steps are split into three separate `if:` steps. The new logic is simpler — restore target is always the solution if provided, otherwise the project. Build target is always the project if provided, otherwise the solution. Both can run independently.
+
+The three redundant restore steps (5a/5b/5c) all run the same command — they can collapse into one. The resolve step already computes the right targets, so restore and build just read those outputs unconditionally.
+
+Clean. One final fix — the `build_mode` output description in the `outputs:` block still references the old label names.
+
+Here's what changed and why:
+
+---
+
+### The key simplification — two independent priority rules
+
+The old version used a three-branch `if/elseif/else` to set targets, then duplicated three nearly identical restore steps gated by `if: build_mode == '...'`. All three ran the same command.
+
+The new resolve step reduces this to two one-liners:
+
+```powershell
+# Restore target: solution wins if provided, else project
+$restoreTarget = if ($hasSln) { $sln } else { $proj }
+
+# Build target: project wins if provided, else solution
+$buildTarget   = if ($hasProj) { $proj } else { $sln }
+```
+
+Because the decision is made once and written to `$GITHUB_OUTPUT`, both the restore step and build step are unconditional — they just read the already-resolved target. Three restore steps became one.
+
+---
+
+### What the Actions UI now shows per mode
+
+| Inputs | Step 5 label | Step 6 label |
+|--------|-------------|-------------|
+| `solution_file` only | `NuGet restore – MyApp.sln` | `dotnet build – solution-only` |
+| `project_file` only | `NuGet restore – MyApp.Api.csproj` | `dotnet build – project-only` |
+| Both | `NuGet restore – MyApp.sln` | `dotnet build – solution-restore · project-build` |
+
+The step names dynamically show the actual file path being operated on, so the run log is self-documenting without needing to expand any step to understand what ran.
