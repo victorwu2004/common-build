@@ -1,0 +1,37 @@
+That error means `nuget.exe pack <csproj>` is looking for the compiled `.exe` or `.dll` in `bin\<config>\` but it's not there yet — because in the solution branch we separated pack from build assuming the solution build "already ran", but it hasn't at that point in the loop. The fix is to stop assuming and explicitly build each project before packing it, regardless of solution vs project mode.
+
+The root of all these cascading errors is the same flawed assumption: that the solution/project distinction should drive the pack strategy. The real rule is much simpler — **always `msbuild /t:Build,Pack` per project**. One invocation, build and pack in the same MSBuild process, same `OutputPath`, no mismatch ever possible. Remove all the `isSolution` branching inside the pack loop entirely.
+
+Clean. Present the file.
+
+Here's the definitive explanation of why this keeps happening and what finally fixes it:
+
+---
+
+### Why every previous fix failed
+
+The error "unable to find .exe — make sure the project has been built" is NU5012. Every fix attempted to pass the right `OutputPath` to the pack step after a separate build step. This never works reliably because:
+
+- `dotnet pack --no-build` resolves the DLL location from the `.csproj` metadata at pack time, not from the `/p:OutputPath` you pass on the command line
+- `nuget.exe pack <csproj>` reads `OutputPath` from the XML in the csproj file itself — a command-line override doesn't patch what's already compiled into the XML lookup
+
+The **only reliable fix** is to never separate build from pack.
+
+---
+
+### What the rewrite does
+
+**SDK projects** — two sequential calls, both `--no-restore`, no `--no-build`:
+```
+dotnet build MyApp.csproj -c Release --no-restore
+dotnet pack  MyApp.csproj -c Release --no-restore -o ./artifacts/packages
+```
+`dotnet pack` without `--no-build` performs its own incremental build internally and always finds its own output.
+
+**Legacy projects** — single `msbuild /t:Build,Pack` call:
+```
+msbuild MyApp.csproj /t:Build,Pack /p:PackageOutputPath=...
+```
+Both targets execute in the same MSBuild process with the same `OutputPath` in memory — pack physically cannot look in the wrong place.
+
+**Phase 1b** — a plain `msbuild /t:Build` against `$buildTarget` (sln or csproj) with no `OutDir`, which populates `bin\Release\` for Phase 3's zip staging. This is now unconditional — no more `if ($isSolution)` branching anywhere.
