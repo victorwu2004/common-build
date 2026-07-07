@@ -1,0 +1,1111 @@
+name: Build .NET Application Workflow
+run-name: "Building '${{ github.repository }}-${{ github.ref_name }}-${{ github.run_number }}'"
+on:
+  workflow_call:
+    inputs:
+      componentName:
+        description: 'Component name'
+        type: string
+        required: true
+      ansible-app-name:
+        description: 'AAP application name, must be onboarded first before using it'
+        type: string
+        required: false
+        default: ''
+      ansible-dry-run:
+        description: 'Ansible CD dry run'
+        type: string
+        required: false
+        default: 'true'
+      configuration:
+        description: 'Build configuration (Debug/Release)'
+        required: false
+        type: string
+        default: 'Release'
+      publish-path:
+        description: 'Path to publish output'
+        required: false
+        type: string
+        default: './publish'
+      run-tests:
+        description: 'Run unit tests'
+        required: false
+        type: boolean
+        default: false
+      test-project-path:
+        description: 'Path to test project(s)'
+        required: false
+        type: string
+        default: '**/*Tests.csproj'
+      MSBuildVersion:
+        description: 'MSBuild version (2019/2022)'
+        type: string
+        default: '2022'
+        required: false
+      # NuGet specific inputs
+      restore-nuget-package:
+        description: 'Create NuGet package'
+        required: false
+        type: boolean
+        default: true
+      appType:
+        description: 'Application type (web/batch/copyFiles/NA)'
+        required: true
+        type: string
+        default: 'batch'
+      buildType:
+        description: 'Build configuration (SNAPSHOT/RELEASE)'
+        required: false
+        type: string
+        default: 'SNAPSHOT'
+      MSBuildArgs:
+        description: 'MSBuild additional arguments, most defaults already included'
+        type: string
+        required: false
+      MSBuildLocation:
+        description: 'Path to MSBuild.exe'
+        type: string
+        required: false
+        default: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\'
+      veracode_app_name:
+        description: 'Veracode Application Name'
+        type: string
+        default: ''
+        required: false
+      veracode_pipeline_scan:
+        description: 'Enable Veracode pipeline scan for SNAPSHOT builds'
+        type: string
+        default: 'true'
+        required: false
+      veracode_enforcement:
+        description: 'Wait for Veracode scan result'
+        type: string
+        default: 'false'
+        required: false
+      sca-scan-enabled:
+        description: 'Enable Nexus IQ security scanning'
+        type: boolean
+        default: true
+        required: false
+      sca-scan-stage:
+        description: 'IQ scan stage (develop, build, stage-release, release, operate)'
+        type: string
+        required: false
+        default: 'build'
+      sca-scan-fail-on-violations:
+        description: 'Fail build on security policy violations'
+        type: string
+        default: 'false'
+        required: false
+      artifact-signing-enabled:
+        description: 'Enable artifact signing'
+        type: string
+        required: false
+        default: 'false'
+      debug:
+        description: 'Enable pipeline debug logging'
+        type: string
+        required: false
+        default: 'false'
+      # ---------------------------------------------------------------
+      # MSBuildSolution / MSBuildProject — build vs pack/zip scope
+      #
+      #  ┌──────────────────────────────────┬──────────────────┬──────────────────┐
+      #  │ Inputs provided                  │ BUILD            │ PACK + ZIP        │
+      #  ├──────────────────────────────────┼──────────────────┼──────────────────┤
+      #  │ (neither)                        │ first .sln found │ all non-test      │
+      #  │ MSBuildSolution only             │ that solution    │ all non-test      │
+      #  │ MSBuildProject only              │ first .sln found │ that project only │
+      #  │                                  │ (or the project  │                   │
+      #  │                                  │  if no .sln)     │                   │
+      #  │ MSBuildSolution + MSBuildProject │ that solution    │ that project only │
+      #  └──────────────────────────────────┴──────────────────┴──────────────────┘
+      #
+      #  • BUILD always compiles the whole solution (VS-style dependency
+      #    order) so project-to-project references resolve. Only when no
+      #    .sln exists at all does it build the bare project.
+      #  • MSBuildProject narrows PACK and ZIP to that single project.
+      #  • MSBuildSolution, when given, MUST match a file on disk (a repo
+      #    may contain several .sln, so the input disambiguates); if it
+      #    matches nothing, the build fails with a clear error.
+      # ---------------------------------------------------------------
+      MSBuildSolution:
+        description: >
+          Path or glob to the solution file (.sln) that drives the build.
+          If provided it MUST match a file in the repo (fails otherwise).
+          If omitted, the first .sln found in the repo is used.
+          Example: MyApp.sln
+        required: false
+        type: string
+        default: '**/*.sln'
+      MSBuildProject:
+        description: >
+          Path or glob to a specific project file (.csproj / .vbproj / .fsproj).
+          When provided, PACK and ZIP are limited to this project only
+          (the solution is still built in full for correct references).
+          Leave empty to pack/zip all non-test projects.
+        required: false
+        type: string
+        default: ''
+      postBuildScript:
+        description: 'Optional post-build script to execute'
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        required: true
+        type: string
+        default: 'true'
+      deploy_dev:
+        required: false
+        type: string
+        default: ''
+      deploy_sit:
+        required: false
+        type: string
+        default: ''
+      deploy_uat:
+        required: false
+        type: string
+        default: ''
+      deploy_prd:
+        required: false
+        type: string
+        default: ''
+      deploy_dr:
+        required: false
+        type: string
+        default: ''
+      sign-artifacts:
+        required: false
+        type: string
+        default: 'true'
+    outputs:
+      appName:
+        description: 'Name of the uploaded artifact'
+        value: ${{ jobs.build.outputs.appName }}
+      version:
+        description: 'Build version'
+        value: ${{ jobs.build.outputs.version }}
+      nuget-appName:
+        description: 'Name of the NuGet package artifact'
+        value: ${{ jobs.build.outputs.nuget-appName }}
+      nexus_url:
+        description: 'Nexus URL of the artifact file'
+        value: ${{ jobs.build.outputs.nexus_url }}
+    secrets:
+      ISSUEOPS_CLIENT_ID:
+        required: false
+      ISSUEOPS_PRIVATE_KEY:
+        required: false
+      AAP_URL_PROD:
+        required: false
+      AAP_URL_NONPROD:
+        required: false
+      AAP_TOKEN:
+        required: false
+      NEXUS_USERNAME:
+        required: false
+      NEXUS_PASSWORD:
+        required: false
+      NEXUSIQ_USERNAME:
+        required: false
+      NEXUSIQ_PASSWORD:
+        required: false
+      VERACODE_API_ID:
+        required: false
+      VERACODE_API_KEY:
+        required: false
+      PROD_PRIVATE_KEY_032426:
+        required: false
+      PROD_PRIVATE_KEY_PASSWORD:
+        required: false
+      NON_PROD_PRIVATE_KEY_032426:
+        required: false
+      NON_PROD_PRIVATE_KEY_PASSWORD:
+        required: false
+jobs:
+  build:
+    runs-on: Windows
+    outputs:
+      appName: ${{ steps.get-prefix.outputs.appName }}
+      version: ${{ steps.version.outputs.version }}
+      nuget-appName: ${{ steps.nuget-pack.outputs.nuget-appName }}
+      nexus_url: ${{ steps.publishtonexus.outputs.nexus_url }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: GSI Value
+        id: get-prefix
+        shell: pwsh
+        run: |
+          # $env:GITHUB_REPOSITORY is "org/repo-name" — split on '/' and take the repo part
+          $repoFullName = $env:GITHUB_REPOSITORY
+          $repoName     = $repoFullName.Split('/')[1]
+
+          # Safely extract the first 3 characters
+          $prefix = $repoName.Substring(0, [Math]::Min(3, $repoName.Length)).ToUpper()
+
+          Write-Host "Repository : $repoFullName"
+          Write-Host "Repo name  : $repoName"
+          Write-Host "GSI        : $prefix"
+
+          # Write to GITHUB_OUTPUT — available to all later steps in this job
+          "appName=$prefix" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "appName    : $prefix"
+
+      - name: Generate version
+        id: version
+        shell: pwsh
+        run: |
+          function Get-XmlTagValue {
+              param (
+                  [string]$Path,
+                  [string]$Tag
+              )
+              if (-not (Test-Path -Path $Path)) {
+                  return ""
+              }
+              $content = Get-Content -Raw -ErrorAction SilentlyContinue $Path
+              if ([string]::IsNullOrEmpty($content)) {
+                  return ""
+              }
+              $pattern = "(?<=<$Tag>)[^<]+"
+              $match = [regex]::Match($content, $pattern)
+              if ($match.Success) { return $match.Value.Trim() } else { return "" }
+          }
+
+          $versionPrefix = ""
+
+          $directoryBuildPropsPath = "Directory.Build.props"
+          if (Test-Path -Path $directoryBuildPropsPath) {
+              $versionPrefix = Get-XmlTagValue -Path $directoryBuildPropsPath -Tag "VersionPrefix"
+          }
+
+          $projectPath = $env:INPUT_PROJECT_PATH
+          if ([string]::IsNullOrEmpty($versionPrefix) -and -not [string]::IsNullOrEmpty($projectPath) -and (Test-Path -Path $projectPath)) {
+              $versionPrefix = Get-XmlTagValue -Path $projectPath -Tag "Version"
+              if ([string]::IsNullOrEmpty($versionPrefix)) {
+                  $versionPrefix = Get-XmlTagValue -Path $projectPath -Tag "VersionPrefix"
+              }
+          }
+
+          if ([string]::IsNullOrEmpty($versionPrefix)) {
+              $versionPrefix = "1.0.0"
+          }
+
+          $githubRef = $env:GITHUB_REF
+          $mainRefMatches = @("refs/heads/main", "refs/heads/master")
+
+          $branchName = $env:GITHUB_REF_NAME
+          if ([string]::IsNullOrEmpty($branchName)) {
+              $branchName = ""
+          }
+
+          # Replace non-alphanumeric characters with '-' and limit to 20 characters.
+          $branchName = ($branchName -replace '[^a-zA-Z0-9]', '-')
+          if ($branchName.Length -gt 20) {
+              $branchName = $branchName.Substring(0, 20)
+          }
+
+          $runNumber = $env:GITHUB_RUN_NUMBER
+          if ([string]::IsNullOrEmpty($runNumber)) {
+              $runNumber = "0"
+          }
+
+          $version = "$versionPrefix-$branchName.$runNumber"
+
+          $githubOutputPath = $env:GITHUB_OUTPUT
+          if ([string]::IsNullOrEmpty($githubOutputPath)) {
+              throw "GITHUB_OUTPUT environment variable is not set."
+          }
+          # create output value
+          Add-Content -Path $githubOutputPath -Value "version=$version"
+          Add-Content -Path $githubOutputPath -Value "version-prefix=$versionPrefix"
+
+          Write-Host "Generated version: $version"
+
+      - name: Build Variables
+        id: buildvariables
+        shell: pwsh
+        run: |
+          $appType       = "${{ inputs.appType }}"
+          $componentName = "${{ inputs.componentName }}"
+
+          # ── Set build output directory ─────────────────────────
+          if ($appType -eq "web") {
+            $buildOutputDir = "${{ github.workspace }}\artifacts\_PublishedWebsites\"
+            $msbuildArgs    = "minimal /p:OutDir=""${{ github.workspace }}\artifacts\_PublishedWebsites\$componentName"" /p:WebPublishMethod=Package"
+          } else {
+            $buildOutputDir = "${{ github.workspace }}\artifacts\"
+            $msbuildArgs    = "minimal /p:OutDir=""${{ github.workspace }}\artifacts\$componentName"""
+          }
+
+          Write-Host "github.workspace : ${{ github.workspace }}"
+          Write-Host "MSBuildSolution  : ${{ inputs.MSBuildSolution }}"
+          Write-Host "MSBuildProject   : ${{ inputs.MSBuildProject }}"
+
+          # ── Resolve SOLUTION / PROJECT targets ─────────────────
+          #
+          #  Model:
+          #    • Solution ALWAYS drives the build (VS-style, correct
+          #      dependency order). Input wins; if not provided, the first
+          #      .sln found in the repo is used; if none and a project is
+          #      given, project-only mode.
+          #    • MSBuildProject NARROWS pack + zip to that one project.
+          #      When empty, pack + zip cover all non-test projects.
+          #
+          $slnInput  = "${{ inputs.MSBuildSolution }}".Trim()
+          $projInput = "${{ inputs.MSBuildProject }}".Trim()
+
+          # Treat the default glob as "not explicitly provided"
+          if ($slnInput -eq '**/*.sln') { $slnInput = '' }
+
+          $hasSlnInput = $slnInput  -ne ''
+          $hasProj     = $projInput -ne ''
+
+          # ── Resolve solution file ──────────────────────────────
+          $slnFile = $null
+          if ($hasSlnInput) {
+            # Explicit solution input: MUST match a file on disk, else fail.
+            $slnFile = Get-ChildItem -Path "${{ github.workspace }}" -Filter $slnInput -Recurse -ErrorAction SilentlyContinue |
+                       Select-Object -First 1
+            if (-not $slnFile) {
+              Write-Error "MSBuildSolution '$slnInput' was provided but no matching .sln was found in the repository."
+              exit 1
+            }
+          } else {
+            # No explicit input: find the first .sln in the repo (may be none).
+            $slnFile = Get-ChildItem -Path "${{ github.workspace }}" -Filter '*.sln' -Recurse -ErrorAction SilentlyContinue |
+                       Select-Object -First 1
+            if ($slnFile) {
+              Write-Host "No MSBuildSolution provided — using first .sln found: $($slnFile.FullName)"
+            }
+          }
+
+          # ── Resolve project file (when provided) ───────────────
+          $projFile = $null
+          if ($hasProj) {
+            $projFile = Get-ChildItem -Path "${{ github.workspace }}" -Filter $projInput -Recurse -ErrorAction SilentlyContinue |
+                        Select-Object -First 1
+            if (-not $projFile) {
+              Write-Error "MSBuildProject '$projInput' was provided but no matching project file was found."
+              exit 1
+            }
+          }
+
+          $hasSln = $slnFile -ne $null
+
+          if (-not $hasSln -and -not $hasProj) {
+            Write-Error "No solution found in the repository and no MSBuildProject provided. Nothing to build."
+            exit 1
+          }
+
+          # ── BUILD target: solution when available, else the project ──
+          if ($hasSln) { $buildTarget = $slnFile.FullName }
+          else         { $buildTarget = $projFile.FullName }
+
+          # Restore uses the same target as build.
+          $restoreTarget = $buildTarget
+
+          # ── PACK/ZIP scope: the single project when provided, else all ──
+          #   Empty PACK_TARGET  → pack/zip ALL non-test projects.
+          #   Set   PACK_TARGET  → pack/zip ONLY this project.
+          if ($hasProj) { $packTarget = $projFile.FullName }
+          else          { $packTarget = '' }
+
+          # ── Human-readable mode label ──────────────────────────
+          $buildMode = if     ($hasSln -and $hasProj) { "solution-build · project-pack" }
+                       elseif ($hasSln)               { "solution-build · all-pack" }
+                       else                           { "project-only" }
+
+          Write-Host "──────────────────────────────────────────"
+          Write-Host "Build mode      : $buildMode"
+          Write-Host "Build target    : $buildTarget"
+          Write-Host "Restore target  : $restoreTarget"
+          Write-Host "Pack/zip target : $(if ($packTarget) { $packTarget } else { '<all non-test projects>' })"
+          Write-Host "msbuildArgs     : $msbuildArgs"
+          Write-Host "──────────────────────────────────────────"
+
+          # ── Set Nexus / Veracode stage ─────────────────────────
+          $isRelease = "${{ inputs.buildType }}" -eq "RELEASE"
+          if ($isRelease) {
+            $nexusRepo     = "${{ vars.NEXUS_NET_HOSTED_RELEASES_URL }}"
+            $veracodeStage = "Veracode_Stage"
+          } else {
+            $nexusRepo     = "${{ vars.NEXUS_NET_HOSTED_SNAPSHOTS_URL }}"
+            $veracodeStage = "Veracode_Sandbox_Stage"
+          }
+
+          # ── Export all variables to GITHUB_ENV ────────────────
+          echo "BUILD_OUTPUT_DIR=$buildOutputDir"          >> $env:GITHUB_ENV
+          echo "COMPONENT_NAME=$componentName"             >> $env:GITHUB_ENV
+          echo "MSBUILD_ARGS=$msbuildArgs"                 >> $env:GITHUB_ENV
+          echo "MSBUILD_RESTORE_TARGET=$restoreTarget"     >> $env:GITHUB_ENV
+          echo "MSBUILD_BUILD_TARGET=$buildTarget"         >> $env:GITHUB_ENV
+          echo "MSBUILD_BUILD_MODE=$buildMode"             >> $env:GITHUB_ENV
+          echo "MSBUILD_PACK_TARGET=$packTarget"           >> $env:GITHUB_ENV
+          echo "MSBuildLocation=${{ inputs.MSBuildLocation }}" >> $env:GITHUB_ENV
+          echo "NEXUS_ARTIFACT_REPO=$nexusRepo"            >> $env:GITHUB_ENV
+          echo "VERACODE_STAGE=$veracodeStage"             >> $env:GITHUB_ENV
+          echo "ZIP_ARCHIVE=${{ github.workspace }}\artifacts\${{ steps.get-prefix.outputs.appName }}_${{ inputs.componentName }}_${{ steps.version.outputs.version }}.zip" >> $env:GITHUB_ENV
+
+          # ── Inject PackageId in Directory.Build.props ──────────
+          $SolutionDir  = [System.IO.Path]::GetDirectoryName((Resolve-Path $restoreTarget))
+          $SolutionName = [System.IO.Path]::GetFileNameWithoutExtension($restoreTarget)
+          $Prefix       = "${{ steps.get-prefix.outputs.appName }}.${{ inputs.componentName }}"
+          $PkgPrefix    = if ($Prefix) { "$Prefix.$SolutionName" } else { $SolutionName }
+
+          $PropsFile  = Join-Path $SolutionDir "Directory.Build.props"
+          $BackupFile = Join-Path $SolutionDir "Directory.Build.props.original"
+
+          # Backup existing props if present
+          if (Test-Path $PropsFile) {
+            Write-Host "Backing up existing Directory.Build.props"
+            Copy-Item $PropsFile $BackupFile -Force
+          }
+
+          # Parse .sln for all csproj paths (only meaningful when restore target is a solution)
+          $slnExt = [System.IO.Path]::GetExtension($restoreTarget).ToLower()
+          if ($slnExt -eq '.sln') {
+            $ProjectPaths = Select-String `
+              -Path $restoreTarget `
+              -Pattern 'Project\([^)]+\)\s*=\s*"[^"]+",\s*"([^"]+\.*proj)"' |
+              ForEach-Object { $_.Matches[0].Groups[1].Value } |
+              ForEach-Object { Join-Path $SolutionDir $_ } |
+              ForEach-Object { [System.IO.Path]::GetFullPath($_) }
+          } else {
+            # Project-only mode: single project
+            $ProjectPaths = @($restoreTarget)
+          }
+
+          Write-Host "Found $($ProjectPaths.Count) project(s)"
+
+          $ProjectInfos = @()
+          foreach ($ProjPath in $ProjectPaths) {
+            [xml]$Xml = Get-Content $ProjPath -Raw
+
+            $AssemblyName = $null
+            foreach ($pg in $Xml.Project.PropertyGroup) {
+              if (-not $AssemblyName -and $pg.AssemblyName) {
+                $AssemblyName = $pg.AssemblyName.Trim()
+              }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($AssemblyName)) {
+              $AssemblyName = [System.IO.Path]::GetFileNameWithoutExtension($ProjPath)
+              Write-Host "  WARN: No AssemblyName in XML for $(Split-Path $ProjPath -Leaf), using: $AssemblyName"
+            }
+
+            $CleanName = $AssemblyName -replace "^$([regex]::Escape($SolutionName))\.", ""
+            $PackageId = "$PkgPrefix.$CleanName"
+            $RelPath   = [System.IO.Path]::GetRelativePath($SolutionDir, $ProjPath)
+
+            Write-Host "  $(Split-Path $ProjPath -Leaf)"
+            Write-Host "    AssemblyName : $AssemblyName"
+            Write-Host "    PackageId    : $PackageId"
+
+            $ProjectInfos += [PSCustomObject]@{ RelPath = $RelPath; PackageId = $PackageId }
+          }
+
+          # Generate Directory.Build.props
+          $Lines = @()
+          $Lines += "<!-- Auto-generated by CI pipeline - do not commit -->"
+          $Lines += "<Project>"
+          $Lines += ""
+          if (Test-Path $BackupFile) {
+            $Lines += "  <Import Project=`"Directory.Build.props.original`" />"
+            $Lines += ""
+          }
+          foreach ($info in $ProjectInfos) {
+            $AbsPath = [System.IO.Path]::GetFullPath((Join-Path $SolutionDir $info.RelPath))
+            $Lines += "  <!-- $($info.RelPath) -->"
+            $Lines += "  <PropertyGroup Condition=`"'`$(MSBuildProjectFullPath.ToLower())' == '$($AbsPath.ToLower())'`">"
+            $Lines += "    <PackageId>$($info.PackageId)</PackageId>"
+            $Lines += "    <IsPackable>$($info.IsPackable)</IsPackable>"
+            $Lines += "  </PropertyGroup>"
+            $Lines += ""
+          }
+          $Lines += "</Project>"
+          $Content = $Lines -join "`r`n"
+          Set-Content -Path $PropsFile -Value $Content -Encoding UTF8
+
+          Write-Host "=== Generated Directory.Build.props ==="
+          Get-Content $PropsFile
+
+      - name: Run NuGet Restore
+        if: inputs.restore-nuget-package
+        shell: pwsh
+        run: |
+          $restoreTarget = $env:MSBUILD_RESTORE_TARGET
+          $buildMode     = $env:MSBUILD_BUILD_MODE
+          $nugetExe      = "d:\nuget\nuget.exe"
+          $nugetConfig   = "d:\nuget\NuGetGHE.Config"
+
+          Write-Host "Build mode     : $buildMode"
+          Write-Host "Restore target : $restoreTarget"
+
+          # Restore always runs against the resolved restore target
+          # (the solution when both inputs are provided).
+          Write-Host "Running NuGet restore on: $restoreTarget"
+          & $nugetExe restore $restoreTarget -ConfigFile $nugetConfig
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "NuGet restore failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+
+      - name: "Build, Pack, Publish, Zip"
+        shell: pwsh
+        run: |
+          $OutputDir   = "./artifacts/packages"
+          $buildOut    = "$PWD/artifacts/build-output"
+          $publishRoot = "./artifacts/publish"
+          $zipPath     = "$env:ZIP_ARCHIVE"
+          New-Item -ItemType Directory -Force -Path $OutputDir, $buildOut, $publishRoot | Out-Null
+          $env:Path += ";$env:MSBuildLocation"
+
+          # Clean any leftover artifacts from prior runs
+          Remove-Item "$OutputDir\*.nupkg" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$publishRoot\*"     -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "$buildOut\*"        -Recurse -Force -ErrorAction SilentlyContinue
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+
+          # ============================================================
+          # Resolve targets from env (set in buildvariables)
+          # ============================================================
+          $buildTarget   = $env:MSBUILD_BUILD_TARGET
+          $restoreTarget = $env:MSBUILD_RESTORE_TARGET
+          $buildMode     = $env:MSBUILD_BUILD_MODE
+          $packTarget    = $env:MSBUILD_PACK_TARGET   # '' = pack/zip ALL non-test projects
+
+          $ext        = [System.IO.Path]::GetExtension($buildTarget).ToLower()
+          $isSolution = $ext -eq '.sln'
+          $isProject  = $ext -in '.csproj','.vbproj','.fsproj'
+
+          if (-not ($isSolution -or $isProject)) {
+              Write-Error "Build target must be .sln or .csproj/.vbproj/.fsproj: $buildTarget"
+              exit 1
+          }
+
+          $packScoped = -not [string]::IsNullOrWhiteSpace($packTarget)
+
+          Write-Host "Build mode      : $buildMode"
+          Write-Host "Build target    : $buildTarget (solution=$isSolution)"
+          Write-Host "Pack/zip scope  : $(if ($packScoped) { $packTarget } else { '<all non-test projects>' })"
+
+          function Get-ProjInfo($projPath) {
+              $name = [System.IO.Path]::GetFileNameWithoutExtension($projPath)
+              [xml]$csproj = Get-Content $projPath
+              $xml = $csproj.OuterXml
+              $projDir = Split-Path -Parent $projPath
+
+              $isTest =
+                  ($name -match '(?i)\.tests?$') -or
+                  ($xml -match '(?i)Microsoft\.NET\.Test\.Sdk') -or
+                  ($xml -match '(?i)<IsTestProject>\s*true') -or
+                  ($xml -match '3AC096D0-A1C2-E12C-1390-A8335801FDAB')
+
+              $isWeb =
+                  ($csproj.Project.Import.Project -match 'Microsoft\.WebApplication\.targets') -or
+                  ($xml -match '349c5851-65df-11da-9384-00065b846f21')
+
+              $isSdk = $csproj.Project.Sdk -ne $null
+
+              [PSCustomObject]@{
+                  Path = $projPath; Name = $name; ProjDir = $projDir
+                  IsTest = $isTest; IsWeb = $isWeb; IsSdk = $isSdk
+              }
+          }
+
+          # ============================================================
+          # Enumerate ALL projects in the solution (for staging/reference
+          # context). When building a bare project, the list is just it.
+          # ============================================================
+          if ($isSolution) {
+              $slnDir  = Split-Path -Parent $buildTarget
+              $slnText = Get-Content $buildTarget -Raw
+              $allProjectPaths =
+                  [regex]::Matches($slnText, 'Project\("\{[^}]+\}"\)\s*=\s*"[^"]+",\s*"([^"]+\.(?:cs|vb|fs)proj)"') |
+                  ForEach-Object {
+                      $full = Join-Path $slnDir $_.Groups[1].Value
+                      if (Test-Path $full) { (Resolve-Path $full).Path }
+                  } | Where-Object { $_ }
+          } else {
+              $allProjectPaths = @((Resolve-Path $buildTarget).Path)
+          }
+
+          $projects = $allProjectPaths | ForEach-Object { Get-ProjInfo $_ }
+
+          # ============================================================
+          # Determine pack/zip set:
+          #   packScoped → ONLY the specified project
+          #   else       → ALL non-test projects
+          # ============================================================
+          if ($packScoped) {
+              $packFull = (Resolve-Path $packTarget).Path
+              $packProjects = $projects | Where-Object { $_.Path.ToLower() -eq $packFull.ToLower() }
+              if (-not $packProjects) {
+                  # Project may not be listed in the solution; classify it directly.
+                  $packProjects = @(Get-ProjInfo $packFull)
+              }
+          } else {
+              $packProjects = $projects | Where-Object { -not $_.IsTest }
+          }
+
+          Write-Host ("All projects  : {0} total ({1} test, {2} web)" -f `
+              $projects.Count,
+              ($projects | Where-Object IsTest).Count,
+              ($projects | Where-Object IsWeb).Count)
+          Write-Host ("Pack/zip set  : {0} project(s)" -f @($packProjects).Count)
+
+          # ============================================================
+          # PHASE 1: BUILD — always build the whole target ONCE.
+          #
+          # Building the solution (not project-by-project) lets MSBuild
+          # compute dependency order from the .sln, exactly like Visual
+          # Studio. This resolves CS0234 "type/namespace does not exist"
+          # errors that occur when a project is compiled before a project
+          # it references. Web projects are built with the publish target
+          # so _PublishedWebsites\<Name>\ is populated for packing/staging.
+          #
+          # Legacy vs SDK doesn't matter here — a solution build handles
+          # both. We only branch on project type later, at PACK time.
+          # ============================================================
+          Write-Host "=== Build ($buildMode) ==="
+
+          # Detect whether any web projects exist → enables publish output.
+          $hasWeb = @($projects | Where-Object IsWeb).Count -gt 0
+
+          $commonProps = @(
+              "/p:Configuration=${{ inputs.configuration }}"
+              "/p:Platform=Any CPU"          # solution-level platform IS spaced;
+                                             # array element preserves the space,
+                                             # no inner quotes needed (they'd be literal)
+              "/p:Version=${{ steps.version.outputs.version }}"
+              "/p:AssemblyVersion=${{ steps.version.outputs.version }}"
+              "/p:Authors=MUFG"
+          )
+
+          if ($isSolution) {
+              # Solution build. If web projects exist, drive the publish
+              # pipeline so _PublishedWebsites is produced under $buildOut.
+              $slnBuildArgs = @(
+                  $buildTarget
+                  "/t:Build"
+                  "/m"
+                  "/v:minimal"
+                  "/nologo"
+              ) + $commonProps
+
+              if ($hasWeb) {
+                  # OutDir routes web publish output into _PublishedWebsites\<Name>
+                  $slnBuildArgs += "/p:OutDir=$buildOut\"
+              }
+
+              & msbuild @slnBuildArgs
+              if ($LASTEXITCODE -ne 0) { Write-Error "Solution build failed"; exit $LASTEXITCODE }
+          }
+          else {
+              # Bare project build — project-level platform is 'AnyCPU' (no space),
+              # explicit OutputPath guards unset BaseOutputPath.
+              $projBin = Join-Path (Split-Path -Parent $buildTarget) "bin\${{ inputs.configuration }}\"
+              & msbuild $buildTarget `
+                  /t:Build `
+                  "/p:Configuration=${{ inputs.configuration }}" `
+                  "/p:Platform=AnyCPU" `
+                  "/p:OutputPath=$projBin" `
+                  "/p:Version=${{ steps.version.outputs.version }}" `
+                  "/p:AssemblyVersion=${{ steps.version.outputs.version }}" `
+                  /p:Authors="MUFG" `
+                  /m /v:minimal /nologo
+              if ($LASTEXITCODE -ne 0) { Write-Error "Project build failed"; exit $LASTEXITCODE }
+          }
+
+          # ============================================================
+          # PHASE 2: PACK — pack the scoped set (all non-test, or the one
+          # specified project). Web projects pack from _PublishedWebsites
+          # in PHASE 4; here we handle non-web libraries/executables.
+          #
+          # Pack method keyed on project TYPE:
+          #   SDK-style → dotnet pack (Pack target exists)
+          #   Legacy    → nuget.exe pack against the .csproj (no Pack target)
+          #
+          # Build already happened once above, so pack uses --no-build /
+          # -Build:$false and reads the existing bin output.
+          # ============================================================
+          Write-Host "=== Pack libraries ==="
+          foreach ($p in $packProjects | Where-Object { -not $_.IsTest -and -not $_.IsWeb }) {
+              $projBin = Join-Path (Split-Path -Parent $p.Path) "bin\${{ inputs.configuration }}\"
+              Write-Host "  pack: $($p.Name) (SDK=$($p.IsSdk))"
+
+              if ($p.IsSdk) {
+                  & dotnet pack $p.Path `
+                      -c "${{ inputs.configuration }}" `
+                      --no-build `
+                      -o $OutputDir `
+                      /p:Version="${{ steps.version.outputs.version }}" `
+                      /p:AssemblyVersion="${{ steps.version.outputs.version }}" `
+                      /p:Authors="MUFG" `
+                      --verbosity quiet
+                  if ($LASTEXITCODE -ne 0) { Write-Error "Pack failed for $($p.Name)"; exit $LASTEXITCODE }
+              }
+              else {
+                  # Legacy: nuget.exe pack. -IncludeReferencedProjects rolls
+                  # referenced projects into the package (per requirement).
+                  & d:\nuget\nuget.exe pack $p.Path `
+                      -Build:$false `
+                      -Properties "Configuration=${{ inputs.configuration }};Platform=AnyCPU;OutDir=$projBin" `
+                      -IncludeReferencedProjects `
+                      -OutputDirectory $OutputDir `
+                      -Version ${{ steps.version.outputs.version }} `
+                      -Verbosity quiet
+                  if ($LASTEXITCODE -ne 0) { Write-Error "Pack failed for $($p.Name)"; exit $LASTEXITCODE }
+              }
+          }
+
+          # ============================================================
+          # PHASE 3: Collect build output into $buildOut for staging/zip.
+          #
+          # The solution build wrote each project's output to its own
+          # bin\<config>\ (and web projects to _PublishedWebsites via
+          # OutDir). Copy non-web project bins into $buildOut so PHASE 5
+          # staging can assemble deployables. Web output already sits in
+          # $buildOut\_PublishedWebsites\<Name> when $hasWeb.
+          # ============================================================
+          Write-Host "=== Collect outputs for staging ==="
+          foreach ($p in $packProjects | Where-Object { -not $_.IsWeb }) {
+              $srcBin = Join-Path (Split-Path -Parent $p.Path) "bin\${{ inputs.configuration }}"
+              if (Test-Path $srcBin) {
+                  Write-Host "  collect: $($p.Name) <- $srcBin"
+                  Copy-Item -Path "$srcBin\*" -Destination $buildOut -Recurse -Force -ErrorAction SilentlyContinue
+              } else {
+                  Write-Warning "  bin output not found for $($p.Name): $srcBin"
+              }
+          }
+
+          $pubWebRoot = Join-Path $buildOut "_PublishedWebsites"
+
+          # ============================================================
+          # PHASE 4: Pack WEB projects from _PublishedWebsites
+          # ============================================================
+          Write-Host "=== Packing web projects ==="
+          foreach ($p in $packProjects | Where-Object { -not $_.IsTest -and $_.IsWeb }) {
+              $webSrc = Join-Path $pubWebRoot $p.Name
+              if (-not (Test-Path $webSrc)) {
+                  Write-Error "Published web output not found: $webSrc (ensure the web project produced _PublishedWebsites)"; exit 1
+              }
+              $nuspecPath = Join-Path $env:TEMP "$($p.Name).nuspec"
+              $nuspec = @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+            <metadata>
+              <id>$($p.Name)</id>
+              <version>${{ steps.version.outputs.version }}</version>
+              <authors>MUFG</authors>
+              <description>$($p.Name) web deployment package</description>
+            </metadata>
+            <files>
+              <file src="**\*" target="content" />
+            </files>
+          </package>
+          "@
+              Set-Content -Path $nuspecPath -Value $nuspec -Encoding UTF8
+              Write-Host "  pack: $($p.Name) (web) <- _PublishedWebsites\$($p.Name)"
+              d:\nuget\nuget.exe pack $nuspecPath `
+                  -BasePath $webSrc `
+                  -OutputDirectory $OutputDir `
+                  -Version ${{ steps.version.outputs.version }} `
+                  -Verbosity quiet
+              if ($LASTEXITCODE -ne 0) { Write-Error "Web pack failed for $($p.Name)"; exit $LASTEXITCODE }
+          }
+
+          # ============================================================
+          # PHASE 5: Stage deployables for ZIP (same scope as pack).
+          #   packScoped → only the one project is staged → only it zips.
+          #   else       → all non-test projects staged.
+          # ============================================================
+          Write-Host "=== Staging deployables ==="
+          foreach ($p in $packProjects | Where-Object { -not $_.IsTest }) {
+              $destDir = Join-Path $publishRoot $p.Name
+              if (Test-Path $destDir) { Remove-Item $destDir -Recurse -Force -ErrorAction SilentlyContinue }
+              New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+
+              if ($p.IsWeb) {
+                  $src = Join-Path $pubWebRoot $p.Name
+                  if (-not (Test-Path $src)) {
+                      Write-Error "Published web output not found: $src"; exit 1
+                  }
+                  Write-Host "  web   : $($p.Name) <- _PublishedWebsites\$($p.Name)"
+                  Copy-Item -Path "$src\*" -Destination $destDir -Recurse -Force
+              } else {
+                  [xml]$cx = Get-Content $p.Path
+                  $asmName = ($cx.Project.PropertyGroup.AssemblyName |
+                              Where-Object { $_ } | Select-Object -First 1)
+                  if (-not $asmName) { $asmName = $p.Name }
+
+                  Write-Host "  batch : $($p.Name) (AssemblyName=$asmName)"
+
+                  $otherExes = $projects |
+                      Where-Object { -not $_.IsTest -and -not $_.IsWeb -and $_.Name -ne $p.Name } |
+                      ForEach-Object {
+                          [xml]$x = Get-Content $_.Path
+                          $n = ($x.Project.PropertyGroup.AssemblyName | Where-Object { $_ } | Select-Object -First 1)
+                          if (-not $n) { $n = $_.Name }
+                          "$n.exe"
+                      }
+
+                  foreach ($pat in @("$asmName.exe", "$asmName.exe.config", "$asmName.pdb")) {
+                      Get-ChildItem -Path $buildOut -Filter $pat -File -ErrorAction SilentlyContinue |
+                          Copy-Item -Destination $destDir -Force
+                  }
+                  Get-ChildItem -Path $buildOut -File |
+                      Where-Object {
+                          $_.Extension -in '.dll','.config','.xml','.json' -and
+                          $otherExes -notcontains $_.Name
+                      } |
+                      Copy-Item -Destination $destDir -Force
+              }
+          }
+
+          # ============================================================
+          # Optional postBuildScript
+          # ============================================================
+          if (-not [string]::IsNullOrWhiteSpace("${{ inputs.postBuildScript }}")) {
+            if (Test-Path "${{ inputs.postBuildScript }}") {
+              Write-Host "Executing post-build script: ${{ inputs.postBuildScript }}"
+              & "${{ inputs.postBuildScript }}" '${{ inputs.componentName }}'
+            } else {
+              Write-Host "Post-build script not found: ${{ inputs.postBuildScript }}"
+              Write-Host "Skipping post-build script execution"
+            }
+          }
+
+          # ============================================================
+          # PHASE 6: Zip — each staged project a subfolder at zip root.
+          # Scope already enforced in staging: scoped → one folder.
+          # ============================================================
+          Compress-Archive -Path "$publishRoot\*" -DestinationPath $zipPath -Force
+          Write-Host "Created $zipPath"
+          echo "ARTIFACT_ZIPNAME=$zipPath" >> $env:GITHUB_ENV
+
+          Get-ChildItem $publishRoot -Directory | ForEach-Object { Write-Host "  /$($_.Name)/" }
+
+          Write-Host "=== Packages produced ==="
+          Get-ChildItem $OutputDir -Filter *.nupkg | ForEach-Object { Write-Host "  $($_.Name)" }
+
+      - name: Run tests
+        if: inputs.run-tests
+        shell: pwsh
+        run: |
+          Write-Host "Running tests..."
+          dotnet test "${{ inputs.test-project-path }}" `
+            --configuration "${{ inputs.configuration }}" `
+            --no-build `
+            --verbosity normal `
+            --logger "trx;LogFileName=test-results.trx" `
+            --logger "console;verbosity=detailed" `
+            --collect:"XPlat Code Coverage" `
+            --results-directory ./TestResults
+          Write-Host "Tests completed"
+
+      - name: Upload test results
+        if: inputs.run-tests && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.get-prefix.outputs.appName }}-test-results
+          path: ./TestResults
+          retention-days: 7
+
+      - name: Decrypt string
+        id: decrypt
+        uses: MUFG-APPS/dso-pipeline-modules/.github/actions/encrypt-action@main
+        with:
+          action: decrypt
+          value: "${{ vars.NUGET_API_KEY_ENC }}"
+          nuget_host_url: "${{ vars.NUGET_HOST_URL }}"
+
+      - name: Upload NuGet packages
+        shell: pwsh
+        env:
+          NUGET_API_KEY: ${{ steps.decrypt.outputs.result }}
+          NUGET_HOST_URL: "${{ vars.NUGET_HOST_URL }}"
+        run: |
+          $OutputDir = "./artifacts/packages"
+          cd $env:GITHUB_WORKSPACE
+          Write-Host "Source: $env:NUGET_HOST_URL Current directory: $env:GITHUB_WORKSPACE"
+          $exePath = "d:\nuget\nuget.exe"
+          & $exePath setapikey $env:NUGET_API_KEY -Source "$env:NUGET_HOST_URL"
+          Get-ChildItem -Path $OutputDir -Filter "*.nupkg" -Recurse -File | Sort-Object Name -Unique | ForEach-Object {
+            $filePath = $_.FullName
+            & $exePath push $filePath $env:NUGET_API_KEY -Source "$env:NUGET_HOST_URL"
+            Write-Host "Uploaded: $filePath"
+          }
+
+      - name: Sign Artifacts
+        id: sign_artifacts
+        uses: MUFG-APPS/DSO-pipeline-modules/.github/actions/sign-artifacts@dotnet_updates
+        if: inputs.sign-artifacts == 'true'
+        with:
+          build-type: ${{ inputs.buildType }}
+          artifact-staging-directory: "${{ env.ARTIFACT_ZIPNAME }}"
+          gsi: ${{ steps.get-prefix.outputs.appName }}
+          package-version: ${{ steps.version.outputs.version }}
+          prod-private-key: ${{ secrets.PROD_PRIVATE_KEY_032426 }}
+          prod-private-key-password: ${{ secrets.PROD_PRIVATE_KEY_PASSWORD }}
+          nonprod-private-key: ${{ secrets.NON_PROD_PRIVATE_KEY_032426 }}
+          nonprod-private-key-password: ${{ secrets.NON_PROD_PRIVATE_KEY_PASSWORD }}
+          artifact-storage-url: ${{ vars.ARTIFACT_STORAGE_URL }}
+          artifact-storage-username: ${{ secrets.NEXUS_USERNAME }}
+          artifact-storage-password: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: Publish to Nexus
+        id: publishtonexus
+        uses: MUFG-APPS/dso-pipeline-modules/.github/actions/publish-nexus-windows@main
+        with:
+          zip_file_path:     ${{ env.ARTIFACT_ZIPNAME }}
+          nexus_base_url:    ${{ env.NEXUS_ARTIFACT_REPO }}
+          nexus_target_path: "${{ steps.get-prefix.outputs.appName }}/${{ inputs.componentName }}"
+          nexus_api_key:     ${{ steps.decrypt.outputs.result }}
+
+      - name: Build Summary
+        shell: bash
+        run: |
+          echo "## 🔨 .NET Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Mode | ${{ env.MSBUILD_BUILD_MODE }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Restore Target | ${{ env.MSBUILD_RESTORE_TARGET }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Target | ${{ env.MSBUILD_BUILD_TARGET }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Configuration | ${{ inputs.configuration }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ steps.version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Published URL | ${{ steps.publishtonexus.outputs.nexus_url }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup workspace
+        if: always()
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path $env:GITHUB_WORKSPACE -Force |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+  Code-Scan:
+    needs: [build]
+    runs-on: uat
+    steps:
+      - name: Download artifact from Nexus
+        shell: bash
+        run: |
+          curl -u "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
+            -O -J \
+            "${{ needs.build.outputs.nexus_url }}"
+          ARTIFACT_FILE=$(basename "${{ needs.build.outputs.nexus_url }}")
+          echo "${{ needs.build.outputs.appName }}"
+          echo "ARTIFACT_FILE=${ARTIFACT_FILE}" >> $GITHUB_ENV
+
+      - name: Nexus IQ Security Scan
+        if: ${{ inputs.sca-scan-enabled }}
+        id: nexusiq
+        uses: MUFG-APPS/dso-pipeline-modules/.github/actions/sca-scan@main
+        with:
+          artifact-path:      ${{ env.ARTIFACT_FILE }}
+          organization:       ${{ needs.build.outputs.appName }}
+          nexus-username:     ${{ secrets.NEXUS_USERNAME }}
+          nexus-password:     ${{ secrets.NEXUS_PASSWORD }}
+          nexus-iq-username:  ${{ secrets.NEXUSIQ_USERNAME || secrets.NEXUS_USERNAME }}
+          nexus-iq-password:  ${{ secrets.NEXUSIQ_PASSWORD || secrets.NEXUS_PASSWORD }}
+          nexus-iq-server-url: ${{ vars.NEXUS_IQ_URL || 'https://nexusiq.unionbank.com' }}
+          iq-stage:           ${{ inputs.buildType == 'RELEASE' && 'release' || 'build' }}
+          fail-on-violations: ${{ inputs.sca-scan-fail-on-violations }}
+          debug:              ${{ inputs.debug }}
+        env:
+          NEXUS_USERNAME:       ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD:       ${{ secrets.NEXUS_PASSWORD }}
+          NEXUSIQ_USERNAME:     ${{ secrets.NEXUSIQ_USERNAME || secrets.NEXUS_USERNAME }}
+          NEXUSIQ_PASSWORD:     ${{ secrets.NEXUSIQ_PASSWORD || secrets.NEXUS_PASSWORD }}
+          NEXUS_IQ_SERVER_URL:  ${{ vars.NEXUS_IQ_URL || 'https://nexusiq.unionbank.com' }}
+          IQ_ORGANIZATION:      ${{ needs.build.outputs.appName }}
+          IQ_ORGANIZATION_ID:   ${{ vars.NEXUS_IQ_ORG_ID }}
+          IQ_STAGE:             ${{ inputs.buildType == 'RELEASE' && 'release' || 'build' }}
+          IQ_FAIL_ON_VIOLATIONS: ${{ inputs.sca-scan-fail-on-violations }}
+          ARTIFACT_PATH:        "${{ env.ARTIFACT_FILE }}"
+          GITHUB_TOKEN:         ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:    ${{ github.repository }}
+          GSI:                  ${{ needs.build.outputs.appName }}
+          PIPELINE_DEBUG:       ${{ inputs.debug }}
+
+      - name: Veracode - Pipeline Scan
+        id: veracodePipeline
+        if: ${{ inputs.buildType == 'SNAPSHOT' && inputs.veracode_pipeline_scan == 'true' }}
+        uses: MUFG-APPS/dso-pipeline-modules/.github/actions/veracode-pipeline-scan@main
+        with:
+          nexus_artifact_path: ${{ needs.build.outputs.nexus_url }}
+          app_name:            ${{ inputs.veracode_app_name != '' && inputs.veracode_app_name || needs.build.outputs.appName }}
+          veracode_api_id:     ${{ secrets.VERACODE_API_ID }}
+          veracode_api_key:    ${{ secrets.VERACODE_API_KEY }}
+          nexus_username:      ${{ secrets.NEXUS_USERNAME }}
+          nexus_password:      ${{ secrets.NEXUS_PASSWORD }}
+          fail_on_severity:    "${{ vars.VERACODE_PIPELINESCAN_SEVERITY }}"
+          baseline_file:       ''
+          fail_on_policy_violation: false
+          fail_workflow_on_error:   false
+
+      - name: Veracode - Policy Scan for Release
+        id: veracode
+        if: ${{ inputs.buildType != 'SNAPSHOT' || inputs.veracode_pipeline_scan == 'false' }}
+        uses: MUFG-APPS/dso-pipeline-modules/.github/actions/veracode-upload-scan@main
+        with:
+          nexus_url:           "https://${{ vars.ARTIFACT_STORAGE_URL }}"
+          nexus_artifact_path: ${{ needs.build.outputs.nexus_url }}
+          nexus_username:      ${{ secrets.NEXUS_USERNAME }}
+          nexus_password:      ${{ secrets.NEXUS_PASSWORD }}
+          veracode_api_id:     ${{ secrets.VERACODE_API_ID }}
+          veracode_api_key:    ${{ secrets.VERACODE_API_KEY }}
+          app_name:            ${{ inputs.veracode_app_name == '' && needs.build.outputs.appName || inputs.veracode_app_name }}
+          scan_type:           ${{ inputs.buildType == 'SNAPSHOT' && 'sandbox' || 'policy' }}
+          sandbox_name:        ${{ inputs.componentName }}
+          version:             '${{ github.ref_name }}-${{ github.run_number }}'
+          veracode_enforcement: ${{ inputs.veracode_enforcement }}
+          scan_timeout_minutes: '60'
+          delete_stale_scan:   'force'
+
+      - name: Pipeline Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## 🚀 .NET Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Nexus-IQ Scan | ${{ steps.nexusiq.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Veracode Scan | ${{ steps.veracode.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ needs.build.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Published URL:** ${{ needs.build.outputs.nexus_url }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          find "$GITHUB_WORKSPACE" -mindepth 1 -delete
+
+  CD:
+    needs: [build, Code-Scan]
+    if: inputs.ansible-app-name != ''
+    uses: MUFG-APPS/DSO-pipeline-modules/.github/workflows/ansible-cd.yml@main
+    with:
+      app_name:            ${{ inputs.ansible-app-name }}
+      nexus_artifact_path: ${{ needs.build.outputs.nexus_url }}
+      dry_run:             ${{ inputs.ansible-dry-run }}
+      artifact_version:    ${{ needs.build.outputs.version }}
+      deploy_dev:          ${{ inputs.deploy_dev }}
+      deploy_sit:          ${{ inputs.deploy_sit }}
+      deploy_uat:          ${{ inputs.deploy_uat }}
+      deploy_prd:          ${{ inputs.deploy_prd }}
+      deploy_dr:           ${{ inputs.deploy_dr }}
+    secrets: inherit
