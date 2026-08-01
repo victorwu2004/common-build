@@ -1,0 +1,28 @@
+Good choices. Let me build a single-file HTML portal that:
+
+- Has an editable holdings template you fill in (ticker, shares, cost basis, buy date) — editable right in the browser
+- Live-fetches 3 years of daily prices from Stooq (free, no key, CORS-friendly)
+- Shows portfolio value over time, benchmarked vs SPY, plus per-position gain/loss and an allocation breakdown
+- Runs entirely client-side so it works on GitHub Pages with zero backend
+
+One note on the TradeStation API upfront: it uses OAuth2 and won't work from a static GitHub Pages site (the token exchange needs a secret that can't be safely exposed in client-side code, and their endpoints don't allow browser CORS). So this portal uses Stooq for prices and a manual/CSV holdings template. I'll flag how to wire in TradeStation later if you want to run a small fetch step. Let me check the frontend skill and build it.
+
+Now I'll build the portal. Design direction: a "terminal-desk" aesthetic — dark instrument-panel feel that fits a systematic trader, with a monospace data face and a restrained cyan/amber signal palette. Data-forward, not decorative.
+
+Let me fix one CSS typo I spotted (a stray space in a variable) and verify the file is clean.
+
+Done. A single `index.html` that runs entirely client-side — no backend, no build step, works on GitHub Pages as-is.
+
+**What it does**
+- Editable holdings ledger, pre-seeded with your tickers (VOO, VGT, SOXX, TQQQ, SGOV) — you fill in shares, cost/share, and optional buy date
+- Live-fetches 3 years of daily closes from Stooq (free, no key) when you hit **Run**
+- Portfolio value over time charted against **SPY normalized to your starting value**
+- Per-position last/market-value/P&L/P&L% in the table, plus four KPIs and an allocation doughnut
+- **Import/Export CSV** so you can fill the template offline and reload it
+
+**To deploy**
+Drop the file into a repo as `index.html` → Settings → Pages → deploy from `main` branch → it's live at `username.github.io/reponame`.
+
+**Two things to know**
+- Stooq uses US ticker suffixes under the hood (handled automatically). If a ticker ever returns "no data," it's usually a symbol mismatch — check the ledger entry.
+- On TradeStation: I built this around Stooq because a public GitHub Pages site can't safely hold the OAuth secret TradeStation requires, and their API blocks browser requests via CORS. The clean pattern is a small local script that pulls your fills and writes the CSV this page imports — your secret stays on your machine, the public page only ever sees prices. Given your Python setup, I can write that TradeStation→CSV exporter script next if you want it.
